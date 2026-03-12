@@ -29,6 +29,14 @@ log() {
   fi
 }
 
+run_priv() {
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
 is_pkg_installed() {
   local pkg="$1"
   dpkg-query -W -f='${Status}' "${pkg}" 2>/dev/null | grep -q "install ok installed"
@@ -40,7 +48,7 @@ install_package() {
     log "Package '${pkg}' already installed."
   else
     log "Installing '${pkg}'..."
-    sudo apt-get -y install "${pkg}"
+    run_priv apt-get -y install "${pkg}"
   fi
 }
 
@@ -79,27 +87,27 @@ fi
 }
 
 if [[ "${RUN_UPDATES}" == "true" ]]; then
-  sudo apt-get update
+  run_priv apt-get update
 fi
 
 install_package "wireguard"
 install_package "wireguard-tools"
 
-sudo mkdir -p /etc/wireguard
-if ! sudo test -f /etc/wireguard/wg0.conf || ! sudo cmp -s "${CONF_SOURCE}" /etc/wireguard/wg0.conf; then
-  sudo install -m 0600 "${CONF_SOURCE}" /etc/wireguard/wg0.conf
+run_priv mkdir -p /etc/wireguard
+if ! run_priv test -f /etc/wireguard/wg0.conf || ! run_priv cmp -s "${CONF_SOURCE}" /etc/wireguard/wg0.conf; then
+  run_priv install -m 0600 "${CONF_SOURCE}" /etc/wireguard/wg0.conf
   log "Installed new /etc/wireguard/wg0.conf"
 else
   log "Existing /etc/wireguard/wg0.conf is already up-to-date."
 fi
 
-if ! sudo wg show wg0 >/dev/null 2>&1; then
-  sudo wg-quick up wg0
+if ! run_priv wg show wg0 >/dev/null 2>&1; then
+  run_priv wg-quick up wg0
   log "Started wg0 interface."
 else
   log "wg0 is already up."
 fi
 
-sudo systemctl enable wg-quick@wg0.service >/dev/null
+run_priv systemctl enable wg-quick@wg0.service >/dev/null
 printf "WireGuard client installation complete.\n"
 

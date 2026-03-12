@@ -25,6 +25,7 @@ VERBOSE="false"
 PEER_IP=""
 PEER_NAME=""
 SERVER_IP=""
+SERVER_ENDPOINT=""
 SERVER_PORT=""
 MA_MODE="false"
 CLIENT_ALLOWED_IPS=""
@@ -35,7 +36,7 @@ ADAPTER=""
 BRANCH="main"
 FORCE_CONF="false"
 VERSION_CONF=""
-CLI_SERVER_IP=""
+CLI_SERVER_ENDPOINT=""
 CLI_SERVER_PORT=""
 
 SERVER_CONF_FILE=""
@@ -57,7 +58,7 @@ Commands:
   add <peer_name>      Create client config and register peer
   list                 List known peers
   remove <target>      Remove peer by name or public key
-  show [peer_name]     Show one client config (or all peers if omitted)
+  show [peer_name]     Show client config, or live 'wg show' status if omitted
   update <peer_name>   Recreate keys/config for existing peer (keeps IP)
   status               Show wg interface status
   help                 Show this help
@@ -69,7 +70,7 @@ Options:
   -o              Overwrite existing client.
   -p SERVER_PORT  Set server listen port.
   -q              Display QR code on screen.
-  -s SERVER_IP    Set server public endpoint IP.
+  -s ENDPOINT_IP  Set server public endpoint IP.
   -v              Verbose output.
   -D              Delete client files on remove.
 EOF
@@ -98,15 +99,16 @@ load_server_conf() {
     rm -f "${conf_tmp}"
   fi
 
-  SERVER_IP="${SERVER_IP:-$(ip -o route get to 1 | awk '{for (i=1; i<=NF; i++) if ($i=="src") print $(i+1)}' | head -n1)}"
+  SERVER_IP="${SERVER_IP:-10.100.200.1}"
+  SERVER_ENDPOINT="${SERVER_ENDPOINT:-$(ip -o route get to 1 | awk '{for (i=1; i<=NF; i++) if ($i=="src") print $(i+1)}' | head -n1)}"
   if [[ -z "${SERVER_PORT:-}" ]] && sudo test -f "${SERVER_WG_CONF_FILE}"; then
     SERVER_PORT="$(sudo awk -F'=' '/^ListenPort/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "${SERVER_WG_CONF_FILE}")"
   fi
   SERVER_PORT="${SERVER_PORT:-51820}"
   MA_MODE="${MA_MODE:-false}"
   CLIENT_ALLOWED_IPS="${CLIENT_ALLOWED_IPS:-}"
-  if [[ -n "${CLI_SERVER_IP}" ]]; then
-    SERVER_IP="${CLI_SERVER_IP}"
+  if [[ -n "${CLI_SERVER_ENDPOINT}" ]]; then
+    SERVER_ENDPOINT="${CLI_SERVER_ENDPOINT}"
   fi
   if [[ -n "${CLI_SERVER_PORT}" ]]; then
     SERVER_PORT="${CLI_SERVER_PORT}"
@@ -162,27 +164,14 @@ set_last_ip() {
 
 resolve_peer() {
   local target="$1"
-  local mode
 
   RESOLVED_PEER_IP=""
   RESOLVED_PEER_NAME=""
   RESOLVED_PEER_PUB=""
 
-  if [[ "${target}" == *"=" ]]; then
-    mode="pub"
-  else
-    mode="name"
-  fi
-
   while IFS=, read -r ip name pub; do
     [[ -z "${ip}" ]] && continue
-    if [[ "${mode}" == "pub" && "${pub}" == "${target}" ]]; then
-      RESOLVED_PEER_IP="${ip}"
-      RESOLVED_PEER_NAME="${name}"
-      RESOLVED_PEER_PUB="${pub}"
-      return 0
-    fi
-    if [[ "${mode}" == "name" && "${name}" == "${target}" ]]; then
+    if [[ "${pub}" == "${target}" || "${name}" == "${target}" ]]; then
       RESOLVED_PEER_IP="${ip}"
       RESOLVED_PEER_NAME="${name}"
       RESOLVED_PEER_PUB="${pub}"
@@ -190,7 +179,7 @@ resolve_peer() {
     fi
   done < <(sudo cat "${PEER_LIST_FILE}" 2>/dev/null || true)
 
-  if [[ "${mode}" == "name" ]] && sudo test -f "${CLIENTS_DIR}/${target}/${target}.pub"; then
+  if sudo test -f "${CLIENTS_DIR}/${target}/${target}.pub"; then
     RESOLVED_PEER_NAME="${target}"
     RESOLVED_PEER_PUB="$(sudo cat "${CLIENTS_DIR}/${target}/${target}.pub")"
     RESOLVED_PEER_IP="$(sudo awk -F, -v p="${RESOLVED_PEER_PUB}" '$3==p {print $1; exit}' "${PEER_LIST_FILE}" 2>/dev/null || true)"
@@ -270,13 +259,26 @@ update_hosts_entry() {
   local peer_ip="$1"
   local peer_name="$2"
   local add="${3:-true}"
+  local marker="# wg-client"
   local tmp_file
   tmp_file="$(mktemp)"
-  sudo awk -v ip="${peer_ip}" -v name="${peer_name}" '
-    !($1==ip || $2==name) {print}
+  sudo awk -v ip="${peer_ip}" -v name="${peer_name}" -v marker="${marker}" '
+    function is_managed(line, mark) {
+      return line ~ ("[[:space:]]" mark "$")
+    }
+    {
+      if (!is_managed($0, marker)) {
+        print
+        next
+      }
+      if ((ip != "" && $1 == ip) || (name != "" && $2 == name)) {
+        next
+      }
+      print
+    }
   ' /etc/hosts >"${tmp_file}"
   if [[ "${add}" == "true" ]]; then
-    printf "%s %s\n" "${peer_ip}" "${peer_name}" >>"${tmp_file}"
+    printf "%s %s %s\n" "${peer_ip}" "${peer_name}" "${marker}" >>"${tmp_file}"
   fi
   sudo install -m 0644 "${tmp_file}" /etc/hosts
   rm -f "${tmp_file}"
@@ -300,7 +302,7 @@ render_client_config() {
     -e "s|:CLIENT_IP:|${peer_ip}|g" \
     -e "s|:CLIENT_KEY:|${peer_priv_key}|g" \
     -e "s|:SERVER_PUB_KEY:|${server_pub_key}|g" \
-    -e "s|:SERVER_ADDRESS:|${SERVER_IP}|g" \
+    -e "s|:SERVER_ADDRESS:|${SERVER_ENDPOINT}|g" \
     -e "s|:SERVER_PORT:|${SERVER_PORT}|g" \
     -e "s|:ALLOWED_IPS:/24|${allowed_ips}|g" \
     -e "s|:ALLOWED_IPS:|${allowed_ips}|g" \
@@ -364,7 +366,7 @@ cmd_add() {
   local peer_ip="${PEER_IP}"
   local peer_dir peer_priv_file peer_pub_file peer_priv_key peer_pub_key server_pub_key allowed_ips
 
-  check_string "${peer_name}" "PEER_NAME"
+  validate_name "${peer_name}" "peer name"
   ensure_layout
 
   if resolve_peer "${peer_name}"; then
@@ -390,8 +392,8 @@ cmd_add() {
     peer_ip="$(check_ip "${peer_ip}")"
   fi
 
-  if [[ -z "${SERVER_IP}" ]]; then
-    die "Server IP could not be resolved. Use -s to set one."
+  if [[ -z "${SERVER_ENDPOINT}" ]]; then
+    die "Server endpoint could not be resolved. Use -s to set one."
   fi
   if ! sudo test -f "${SERVER_PUB_FILE}"; then
     die "Missing server public key file: ${SERVER_PUB_FILE}"
@@ -404,7 +406,7 @@ cmd_add() {
   peer_priv_file="${peer_dir}/${peer_name}.pri"
   peer_pub_file="${peer_dir}/${peer_name}.pub"
   sudo mkdir -p "${peer_dir}"
-  sudo sh -c "umask 077 && wg genkey | tee '${peer_priv_file}' | wg pubkey >'${peer_pub_file}'"
+  run_priv bash -c 'umask 077 && wg genkey | tee "$1" | wg pubkey >"$2"' _ "${peer_priv_file}" "${peer_pub_file}"
   peer_priv_key="$(sudo cat "${peer_priv_file}")"
   peer_pub_key="$(sudo cat "${peer_pub_file}")"
   server_pub_key="$(sudo cat "${SERVER_PUB_FILE}")"
@@ -443,12 +445,16 @@ cmd_list() {
 
 cmd_remove() {
   local target="$1"
+  if [[ ! "${target}" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+    validate_name "${target}" "peer name"
+  fi
   if ! resolve_peer "${target}"; then
     die "Could not resolve peer '${target}' by name or public key."
   fi
 
   remove_peer_everywhere "${RESOLVED_PEER_IP}" "${RESOLVED_PEER_NAME}" "${RESOLVED_PEER_PUB}"
   if [[ "${DELETE_FILES}" == "true" && -n "${RESOLVED_PEER_NAME}" ]]; then
+    validate_name "${RESOLVED_PEER_NAME}" "peer name"
     sudo rm -rf "${CLIENTS_DIR:?}/${RESOLVED_PEER_NAME}"
     sudo rm -f "${CLIENTS_DIR}/${RESOLVED_PEER_NAME}.zip" "${CLIENTS_DIR}/${RESOLVED_PEER_NAME}.tar.gz"
   fi
@@ -457,10 +463,21 @@ cmd_remove() {
 }
 
 cmd_show() {
-  local peer_name="${1:-}"
-  if [[ -z "${peer_name}" ]]; then
+  local target="${1:-}"
+  local peer_name
+  if [[ -z "${target}" ]]; then
     sudo wg show
     return 0
+  fi
+
+  if [[ "${target}" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+    if ! resolve_peer "${target}"; then
+      die "Could not resolve peer '${target}' by public key."
+    fi
+    peer_name="${RESOLVED_PEER_NAME}"
+  else
+    validate_name "${target}" "peer name"
+    peer_name="${target}"
   fi
 
   local conf="${CLIENTS_DIR}/${peer_name}/wg0.conf"
@@ -474,10 +491,16 @@ cmd_show() {
 }
 
 cmd_update() {
-  local peer_name="$1"
-  if ! resolve_peer "${peer_name}"; then
-    die "Peer '${peer_name}' not found."
+  local target="$1"
+  local peer_name
+  if [[ ! "${target}" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+    validate_name "${target}" "peer name"
   fi
+  if ! resolve_peer "${target}"; then
+    die "Peer '${target}' not found."
+  fi
+  peer_name="${RESOLVED_PEER_NAME}"
+  validate_name "${peer_name}" "peer name"
   OVERWRITE="true"
   if [[ -z "${PEER_IP}" ]]; then
     PEER_IP="${RESOLVED_PEER_IP}"
@@ -500,7 +523,7 @@ while getopts "fhi:op:qs:vD" OPTION; do
     o) OVERWRITE="true" ;;
     p) CLI_SERVER_PORT="${OPTARG}" ;;
     q) DISPLAY_QR="true" ;;
-    s) CLI_SERVER_IP="$(check_ip "${OPTARG}")" ;;
+    s) CLI_SERVER_ENDPOINT="$(check_ip "${OPTARG}")" ;;
     v) VERBOSE="true" ;;
     D) DELETE_FILES="true" ;;
     ?)

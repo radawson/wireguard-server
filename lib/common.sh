@@ -96,6 +96,20 @@ check_string() {
   fi
 }
 
+validate_name() {
+  local value="${1:-}"
+  local label="${2:-name}"
+  if [[ -z "${value}" ]]; then
+    die "${label} cannot be empty."
+  fi
+  if [[ "${value}" == -* ]]; then
+    die "Invalid ${label} '${value}': cannot start with '-'."
+  fi
+  if [[ ! "${value}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    die "Invalid ${label} '${value}': only A-Za-z0-9._- are allowed."
+  fi
+}
+
 require_cmd() {
   local cmd
   for cmd in "$@"; do
@@ -131,4 +145,12 @@ sudo_write() {
   cat >"${tmp_file}"
   sudo install -m "${mode}" "${tmp_file}" "${target}"
   rm -f "${tmp_file}"
+}
+
+run_priv() {
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
 }

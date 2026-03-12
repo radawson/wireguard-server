@@ -14,7 +14,10 @@ fi
 source "${LIB_FILE}"
 
 # Defaults
-ADAPTER="$(ip route | awk '/^default / {print $5; exit}')"
+ADAPTER="${ADAPTER:-$(ip route | awk '/^default / {print $5; exit}')}"
+if [[ -z "${ADAPTER}" ]]; then
+  die "Could not detect default network adapter. Set ADAPTER env variable or ensure a default route exists."
+fi
 BRANCH="main"
 CLIENT_ALLOWED_IPS="10.100.200.0/24"
 FORCE="false"
@@ -22,6 +25,7 @@ RUN_UPDATES="false"
 OVERWRITE="false"
 MA_MODE="false"
 SERVER_IP="10.100.200.1"
+SERVER_ENDPOINT="$(ip -o route get to 1 | awk '{for (i=1;i<=NF;i++) if ($i=="src") print $(i+1)}' | head -n1)"
 SERVER_PORT="51820"
 SERVER_PRIVATE_FILE="server_key.pri"
 SERVER_PUBLIC_FILE="server_key.pub"
@@ -41,12 +45,13 @@ WG_SHARE_INSTALL_CLIENT="${WG_SHARE}/install-client.sh"
 
 usage() {
   cat <<EOF >&2
-Usage: ${0} [-dfhmouv] [-i IP_RANGE] [-n KEY_NAME] [-p LISTEN_PORT]
+Usage: ${0} [-defhmouv] [-i IP_RANGE] [-n KEY_NAME] [-p LISTEN_PORT]
 Sets up and starts a WireGuard server.
 Version: ${VERSION}
 
 Options:
   -d              Use 'dev' branch metadata.
+  -e ENDPOINT_IP  Set server endpoint IP clients should connect to.
   -f              Force run as root.
   -h, --help      Show this help text.
   -i IP_RANGE     Set server WireGuard IP address.
@@ -113,10 +118,13 @@ if [[ "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-while getopts "dfhi:mn:op:uv" OPTION; do
+while getopts "de:fhi:mn:op:uv" OPTION; do
   case "${OPTION}" in
     d)
       BRANCH="dev"
+      ;;
+    e)
+      SERVER_ENDPOINT="$(check_ip "${OPTARG}")"
       ;;
     f)
       FORCE="true"
@@ -133,6 +141,7 @@ while getopts "dfhi:mn:op:uv" OPTION; do
       CLIENT_ALLOWED_IPS="0.0.0.0/0"
       ;;
     n)
+      validate_name "${OPTARG}" "key name"
       SERVER_PRIVATE_FILE="${OPTARG}.pri"
       SERVER_PUBLIC_FILE="${OPTARG}.pub"
       ;;
@@ -185,6 +194,7 @@ FORCE="${FORCE}"
 INSTALL_DIRECTORY="${INSTALL_DIRECTORY}"
 MA_MODE="${MA_MODE}"
 SERVER_IP="${SERVER_IP}"
+SERVER_ENDPOINT="${SERVER_ENDPOINT}"
 SERVER_PORT="${SERVER_PORT}"
 SERVER_PRIVATE_FILE="${SERVER_PRIVATE_FILE}"
 SERVER_PUBLIC_FILE="${SERVER_PUBLIC_FILE}"
@@ -202,7 +212,7 @@ server_key_pub_path="${SERVER_DIR}/${SERVER_PUBLIC_FILE}"
 
 if [[ "${OVERWRITE}" == "true" ]] || ! sudo test -f "${server_key_pri_path}" || ! sudo test -f "${server_key_pub_path}"; then
   log_info "Generating server key pair..."
-  sudo sh -c "umask 077 && wg genkey | tee '${server_key_pri_path}' | wg pubkey >'${server_key_pub_path}'"
+  run_priv bash -c 'umask 077 && wg genkey | tee "$1" | wg pubkey >"$2"' _ "${server_key_pri_path}" "${server_key_pub_path}"
 else
   log_info "Server key pair already exists; keeping existing keys."
 fi
@@ -276,6 +286,7 @@ log_success "WireGuard server setup complete."
 printf "\nServer details:\n"
 printf "  Data directory: %s\n" "${WG_DIR}"
 printf "  Server IP:      %s\n" "${SERVER_IP}"
+printf "  Endpoint IP:    %s\n" "${SERVER_ENDPOINT}"
 printf "  Listen port:    %s\n" "${SERVER_PORT}"
 printf "  Public key:     %s\n\n" "${SERVER_PUB_KEY}"
 printf "Run `wg-client add <name>` to add a client.\n"
