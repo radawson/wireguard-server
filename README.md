@@ -5,9 +5,9 @@ Scripts and tools for building and maintaining WireGuard networks from the comma
 ## Highlights
 
 - Idempotent install and client-management workflows.
-- Unified `wg-client` command for add/list/remove/show/update/status.
-- Backward-compatible wrappers: `add-client.sh` and `remove-client.sh`.
-- Safer error handling with strict shell mode and better runtime checks.
+- Single omnibus `wg-client` command (`add`, `remove`, `list`, `show`, `update`, `status`).
+- Server data stored in a predictable root-owned location: `/etc/wireguard`.
+- Safer error handling with strict shell mode and runtime checks.
 
 ## Server Installation
 
@@ -23,7 +23,6 @@ By default, the script does **not** run `apt update`/`dist-upgrade`; use `-u` wh
 
 | Flag | Description |
 | :--- | :--- |
-| `-c CONFIG_DIR` | Set configuration directory. |
 | `-d` | Use dev branch metadata. |
 | `-f` | Force run as root. |
 | `-h` / `--help` | Show help. |
@@ -32,19 +31,12 @@ By default, the script does **not** run `apt update`/`dist-upgrade`; use `-u` wh
 | `-n KEY_NAME` | Set server key file name prefix. |
 | `-o` | Overwrite existing server keys/config. |
 | `-p LISTEN_PORT` | Set WireGuard listen port (default `51820`). |
-| `-t TOOL_DIR` | Set tool installation directory (default `~/wireguard`). |
 | `-u` | Run `apt update` and `dist-upgrade`. |
 | `-v` | Verbose output. |
 
 ## Client Management
 
 Main command:
-
-```bash
-~/wireguard/wg-client.sh <command> [options]
-```
-
-If installed globally by `install-server.sh`, you can also use:
 
 ```bash
 wg-client <command> [options]
@@ -73,16 +65,29 @@ wg-client <command> [options]
 | `-p SERVER_PORT` | Override server listen port in generated client config. |
 | `-q` | Print client config as QR code in terminal. |
 | `-s SERVER_IP` | Override server endpoint IP in generated client config. |
-| `-t TOOL_DIR` | Override tool directory. |
 | `-v` | Verbose output. |
-| `-D` | Remove local client files when running `remove`. |
+| `-D` | Remove client files when running `remove`. |
 
-## Compatibility Wrappers
+## Server Configuration File
 
-The following wrappers are kept for backward compatibility:
+`install-server.sh` writes tool metadata to:
 
-- `tools/add-client.sh` -> forwards to `wg-client add`
-- `tools/remove-client.sh` -> forwards to `wg-client remove`
+`/etc/wireguard/wg-server.conf`
+
+Example values:
+
+```bash
+VERSION="2.13.0"
+ADAPTER="eth0"
+MA_MODE="false"
+CLIENT_ALLOWED_IPS="10.100.200.0/24"
+SERVER_IP="10.100.200.1"
+SERVER_PORT="51820"
+SERVER_PRIVATE_FILE="server_key.pri"
+SERVER_PUBLIC_FILE="server_key.pub"
+```
+
+`CLIENT_ALLOWED_IPS` is consumed by `wg-client` when generating client configs (unless `MA_MODE=true`, where `0.0.0.0/0` is used).
 
 ## Client-Side Installation
 
@@ -104,12 +109,20 @@ bash install-client.sh
 
 ## Files and Layout
 
-Default tool layout under `~/wireguard`:
+Server layout:
 
-- `server.conf` - runtime settings
-- `server/wg0.conf` - managed server config
-- `server/server_key.pri` / `server/server_key.pub` - server keypair
-- `clients/<peer_name>/` - per-client files (`wg0.conf`, keys, QR)
-- `clients/<peer_name>.zip` and `.tar.gz` - exported client bundles
-- `peer_list.txt` - tracked peers (`ip,name,pubkey`)
-- `last_ip.txt` - last assigned client IP
+- `/etc/wireguard/wg-server.conf` - runtime settings for tools
+- `/etc/wireguard/wg0.conf` - active server WireGuard config
+- `/etc/wireguard/server/wg0.conf` - managed server template output
+- `/etc/wireguard/server/server_key.pri` / `/etc/wireguard/server/server_key.pub` - server keypair
+- `/etc/wireguard/clients/<peer_name>/` - per-client files (`wg0.conf`, keys, QR)
+- `/etc/wireguard/clients/<peer_name>.zip` and `.tar.gz` - exported client bundles
+- `/etc/wireguard/peer_list.txt` - tracked peers (`ip,name,pubkey`)
+- `/etc/wireguard/last_ip.txt` - last assigned client IP
+- `/etc/wireguard/config/` - config templates
+
+Installed tool files:
+
+- `/usr/local/bin/wg-client`
+- `/usr/local/share/wireguard/lib/common.sh`
+- `/usr/local/share/wireguard/install-client.sh`

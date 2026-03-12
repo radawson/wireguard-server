@@ -6,12 +6,12 @@ VERSION="2.13.0"
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LIB_FILE="${SCRIPT_DIR}/../lib/common.sh"
+LIB_FILE="/usr/local/share/wireguard/lib/common.sh"
 if [[ ! -f "${LIB_FILE}" ]]; then
-  LIB_FILE="${HOME}/wireguard/lib/common.sh"
+  LIB_FILE="${SCRIPT_DIR}/../lib/common.sh"
 fi
 if [[ ! -f "${LIB_FILE}" ]]; then
-  printf "Missing required library file. Expected ../lib/common.sh or ~/wireguard/lib/common.sh\n" >&2
+  printf "Missing required library file. Expected /usr/local/share/wireguard/lib/common.sh or ../lib/common.sh\n" >&2
   exit 1
 fi
 source "${LIB_FILE}"
@@ -22,16 +22,21 @@ OVERWRITE="false"
 DELETE_FILES="false"
 VERBOSE="false"
 
-TOOL_DIR="${HOME}/wireguard"
 PEER_IP=""
 PEER_NAME=""
 SERVER_IP=""
 SERVER_PORT=""
 MA_MODE="false"
-
+CLIENT_ALLOWED_IPS=""
+INSTALL_DIRECTORY="${WG_DIR}"
+SERVER_PRIVATE_FILE="server_key.pri"
+SERVER_PUBLIC_FILE="server_key.pub"
+ADAPTER=""
+BRANCH="main"
+FORCE_CONF="false"
+VERSION_CONF=""
 CLI_SERVER_IP=""
 CLI_SERVER_PORT=""
-CLI_MA_MODE=""
 
 SERVER_CONF_FILE=""
 SERVER_WG_CONF_FILE=""
@@ -65,58 +70,61 @@ Options:
   -p SERVER_PORT  Set server listen port.
   -q              Display QR code on screen.
   -s SERVER_IP    Set server public endpoint IP.
-  -t TOOL_DIR     Set tool installation directory.
   -v              Verbose output.
   -D              Delete client files on remove.
 EOF
 }
 
 refresh_paths() {
-  SERVER_CONF_FILE="${TOOL_DIR}/server.conf"
-  SERVER_WG_CONF_FILE="/etc/wireguard/wg0.conf"
-  PEER_LIST_FILE="${TOOL_DIR}/peer_list.txt"
-  LAST_IP_FILE="${TOOL_DIR}/last_ip.txt"
-  CLIENTS_DIR="${TOOL_DIR}/clients"
-  SERVER_DIR="${TOOL_DIR}/server"
-  CLIENT_TEMPLATE="${TOOL_DIR}/config/wg0-client.example.conf"
-  SERVER_PUB_FILE="${SERVER_DIR}/server_key.pub"
-  INSTALL_CLIENT_SCRIPT="${TOOL_DIR}/install-client.sh"
+  SERVER_CONF_FILE="${WG_CONF}"
+  SERVER_WG_CONF_FILE="${WG_DIR}/wg0.conf"
+  PEER_LIST_FILE="${WG_DIR}/peer_list.txt"
+  LAST_IP_FILE="${WG_DIR}/last_ip.txt"
+  CLIENTS_DIR="${WG_DIR}/clients"
+  SERVER_DIR="${WG_DIR}/server"
+  CLIENT_TEMPLATE="${WG_DIR}/config/wg0-client.example.conf"
+  SERVER_PUB_FILE="${SERVER_DIR}/${SERVER_PUBLIC_FILE}"
+  INSTALL_CLIENT_SCRIPT="${WG_SHARE}/install-client.sh"
 }
 
 load_server_conf() {
+  local conf_tmp
   refresh_paths
-  if [[ -f "${SERVER_CONF_FILE}" ]]; then
+  if sudo test -f "${SERVER_CONF_FILE}"; then
+    conf_tmp="$(mktemp)"
+    sudo cat "${SERVER_CONF_FILE}" >"${conf_tmp}"
     # shellcheck disable=SC1090
-    source "${SERVER_CONF_FILE}"
+    source "${conf_tmp}"
+    rm -f "${conf_tmp}"
   fi
 
   SERVER_IP="${SERVER_IP:-$(ip -o route get to 1 | awk '{for (i=1; i<=NF; i++) if ($i=="src") print $(i+1)}' | head -n1)}"
-  if [[ -z "${SERVER_PORT:-}" && -f "${TOOL_DIR}/server/wg0.conf" ]]; then
-    SERVER_PORT="$(awk -F'=' '/^ListenPort/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "${TOOL_DIR}/server/wg0.conf")"
+  if [[ -z "${SERVER_PORT:-}" ]] && sudo test -f "${SERVER_WG_CONF_FILE}"; then
+    SERVER_PORT="$(sudo awk -F'=' '/^ListenPort/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "${SERVER_WG_CONF_FILE}")"
   fi
   SERVER_PORT="${SERVER_PORT:-51820}"
   MA_MODE="${MA_MODE:-false}"
-
+  CLIENT_ALLOWED_IPS="${CLIENT_ALLOWED_IPS:-}"
   if [[ -n "${CLI_SERVER_IP}" ]]; then
     SERVER_IP="${CLI_SERVER_IP}"
   fi
   if [[ -n "${CLI_SERVER_PORT}" ]]; then
     SERVER_PORT="${CLI_SERVER_PORT}"
   fi
-  if [[ -n "${CLI_MA_MODE}" ]]; then
-    MA_MODE="${CLI_MA_MODE}"
-  fi
+  refresh_paths
 }
 
 ensure_layout() {
-  mkdir -p "${CLIENTS_DIR}" "${SERVER_DIR}"
-  touch "${PEER_LIST_FILE}"
+  sudo mkdir -p "${CLIENTS_DIR}" "${SERVER_DIR}"
+  sudo touch "${PEER_LIST_FILE}"
 }
 
 allowed_ips_for_peer() {
   local peer_ip="$1"
   if [[ "${MA_MODE}" == "true" ]]; then
     printf "0.0.0.0/0\n"
+  elif [[ -n "${CLIENT_ALLOWED_IPS}" ]]; then
+    printf "%s\n" "${CLIENT_ALLOWED_IPS}"
   else
     printf "%s/24\n" "$(awk -F. '{print $1"."$2"."$3".0"}' <<<"${peer_ip}")"
   fi
@@ -130,7 +138,7 @@ next_peer_ip() {
 
   base_ip="${SERVER_IP:-10.100.200.1}"
   base="$(awk -F. '{print $1"."$2"."$3}' <<<"${base_ip}")"
-  last_octet="$(awk -F. '{print $4}' "${LAST_IP_FILE}" 2>/dev/null || true)"
+  last_octet="$(sudo awk -F. '{print $4}' "${LAST_IP_FILE}" 2>/dev/null || true)"
   if [[ -z "${last_octet}" || ! "${last_octet}" =~ ^[0-9]+$ ]]; then
     last_octet="$(awk -F. '{print $4}' <<<"${base_ip}")"
   fi
@@ -149,7 +157,7 @@ next_peer_ip() {
 
 set_last_ip() {
   local ip="$1"
-  printf "%s\n" "${ip}" >"${LAST_IP_FILE}"
+  printf "%s\n" "${ip}" | sudo tee "${LAST_IP_FILE}" >/dev/null
 }
 
 resolve_peer() {
@@ -180,12 +188,12 @@ resolve_peer() {
       RESOLVED_PEER_PUB="${pub}"
       return 0
     fi
-  done <"${PEER_LIST_FILE}"
+  done < <(sudo cat "${PEER_LIST_FILE}" 2>/dev/null || true)
 
-  if [[ "${mode}" == "name" && -f "${CLIENTS_DIR}/${target}/${target}.pub" ]]; then
+  if [[ "${mode}" == "name" ]] && sudo test -f "${CLIENTS_DIR}/${target}/${target}.pub"; then
     RESOLVED_PEER_NAME="${target}"
-    RESOLVED_PEER_PUB="$(cat "${CLIENTS_DIR}/${target}/${target}.pub")"
-    RESOLVED_PEER_IP="$(awk -F, -v p="${RESOLVED_PEER_PUB}" '$3==p {print $1; exit}' "${PEER_LIST_FILE}" 2>/dev/null || true)"
+    RESOLVED_PEER_PUB="$(sudo cat "${CLIENTS_DIR}/${target}/${target}.pub")"
+    RESOLVED_PEER_IP="$(sudo awk -F, -v p="${RESOLVED_PEER_PUB}" '$3==p {print $1; exit}' "${PEER_LIST_FILE}" 2>/dev/null || true)"
     return 0
   fi
 
@@ -243,10 +251,11 @@ remove_from_peer_list() {
   local peer_pub="$3"
   local tmp_file
   tmp_file="$(mktemp)"
-  awk -F, -v ip="${peer_ip}" -v name="${peer_name}" -v pub="${peer_pub}" '
+  sudo awk -F, -v ip="${peer_ip}" -v name="${peer_name}" -v pub="${peer_pub}" '
     !($1==ip || $2==name || $3==pub) {print}
   ' "${PEER_LIST_FILE}" >"${tmp_file}"
-  mv "${tmp_file}" "${PEER_LIST_FILE}"
+  sudo install -m 0600 "${tmp_file}" "${PEER_LIST_FILE}"
+  rm -f "${tmp_file}"
 }
 
 add_to_peer_list() {
@@ -254,7 +263,7 @@ add_to_peer_list() {
   local peer_name="$2"
   local peer_pub="$3"
   remove_from_peer_list "${peer_ip}" "${peer_name}" "${peer_pub}"
-  printf "%s,%s,%s\n" "${peer_ip}" "${peer_name}" "${peer_pub}" >>"${PEER_LIST_FILE}"
+  printf "%s,%s,%s\n" "${peer_ip}" "${peer_name}" "${peer_pub}" | sudo tee -a "${PEER_LIST_FILE}" >/dev/null
 }
 
 update_hosts_entry() {
@@ -280,12 +289,14 @@ render_client_config() {
   local server_pub_key="$4"
   local allowed_ips="$5"
   local out_file="${CLIENTS_DIR}/${peer_name}/wg0.conf"
+  local tmp_file
 
-  if [[ ! -f "${CLIENT_TEMPLATE}" ]]; then
+  if ! sudo test -f "${CLIENT_TEMPLATE}"; then
     die "Missing client template: ${CLIENT_TEMPLATE}"
   fi
 
-  sed \
+  tmp_file="$(mktemp)"
+  sudo sed \
     -e "s|:CLIENT_IP:|${peer_ip}|g" \
     -e "s|:CLIENT_KEY:|${peer_priv_key}|g" \
     -e "s|:SERVER_PUB_KEY:|${server_pub_key}|g" \
@@ -293,18 +304,26 @@ render_client_config() {
     -e "s|:SERVER_PORT:|${SERVER_PORT}|g" \
     -e "s|:ALLOWED_IPS:/24|${allowed_ips}|g" \
     -e "s|:ALLOWED_IPS:|${allowed_ips}|g" \
-    "${CLIENT_TEMPLATE}" >"${out_file}"
+    "${CLIENT_TEMPLATE}" >"${tmp_file}"
+  sudo install -m 0600 "${tmp_file}" "${out_file}"
+  rm -f "${tmp_file}"
 }
 
 package_client_files() {
   require_cmd qrencode zip tar
   local peer_name="$1"
   local client_dir="${CLIENTS_DIR}/${peer_name}"
-  qrencode -o "${client_dir}/${peer_name}.png" <"${client_dir}/wg0.conf"
-  cp -f "${INSTALL_CLIENT_SCRIPT}" "${client_dir}/install-client.sh"
-  rm -f "${CLIENTS_DIR}/${peer_name}.zip" "${CLIENTS_DIR}/${peer_name}.tar.gz"
-  zip -rq "${CLIENTS_DIR}/${peer_name}.zip" "${client_dir}"
-  tar -czf "${CLIENTS_DIR}/${peer_name}.tar.gz" -C "${CLIENTS_DIR}" "${peer_name}"
+  local tmp_conf tmp_png
+  tmp_conf="$(mktemp)"
+  tmp_png="$(mktemp)"
+  sudo cat "${client_dir}/wg0.conf" >"${tmp_conf}"
+  qrencode -o "${tmp_png}" <"${tmp_conf}"
+  sudo install -m 0600 "${tmp_png}" "${client_dir}/${peer_name}.png"
+  sudo install -m 0755 "${INSTALL_CLIENT_SCRIPT}" "${client_dir}/install-client.sh"
+  sudo rm -f "${CLIENTS_DIR}/${peer_name}.zip" "${CLIENTS_DIR}/${peer_name}.tar.gz"
+  sudo zip -rq "${CLIENTS_DIR}/${peer_name}.zip" "${client_dir}"
+  sudo tar -czf "${CLIENTS_DIR}/${peer_name}.tar.gz" -C "${CLIENTS_DIR}" "${peer_name}"
+  rm -f "${tmp_conf}" "${tmp_png}"
 }
 
 ensure_server_peer_block() {
@@ -351,9 +370,11 @@ cmd_add() {
   if resolve_peer "${peer_name}"; then
     if [[ "${OVERWRITE}" != "true" ]]; then
       log_warn "Client '${peer_name}' already exists. Use -o to overwrite."
-      [[ -f "${CLIENTS_DIR}/${peer_name}/wg0.conf" ]] && cat "${CLIENTS_DIR}/${peer_name}/wg0.conf"
-      if [[ "${DISPLAY_QR}" == "true" && -f "${CLIENTS_DIR}/${peer_name}/wg0.conf" ]]; then
-        qrencode -t ansiutf8 <"${CLIENTS_DIR}/${peer_name}/wg0.conf"
+      if sudo test -f "${CLIENTS_DIR}/${peer_name}/wg0.conf"; then
+        sudo cat "${CLIENTS_DIR}/${peer_name}/wg0.conf"
+      fi
+      if [[ "${DISPLAY_QR}" == "true" ]] && sudo test -f "${CLIENTS_DIR}/${peer_name}/wg0.conf"; then
+        sudo cat "${CLIENTS_DIR}/${peer_name}/wg0.conf" | qrencode -t ansiutf8
       fi
       return 0
     fi
@@ -372,23 +393,21 @@ cmd_add() {
   if [[ -z "${SERVER_IP}" ]]; then
     die "Server IP could not be resolved. Use -s to set one."
   fi
-  if [[ ! -f "${SERVER_PUB_FILE}" ]]; then
+  if ! sudo test -f "${SERVER_PUB_FILE}"; then
     die "Missing server public key file: ${SERVER_PUB_FILE}"
   fi
-  if [[ ! -f "${INSTALL_CLIENT_SCRIPT}" ]]; then
+  if ! sudo test -f "${INSTALL_CLIENT_SCRIPT}"; then
     die "Missing install-client script in tool directory: ${INSTALL_CLIENT_SCRIPT}"
   fi
 
   peer_dir="${CLIENTS_DIR}/${peer_name}"
   peer_priv_file="${peer_dir}/${peer_name}.pri"
   peer_pub_file="${peer_dir}/${peer_name}.pub"
-  mkdir -p "${peer_dir}"
-
-  umask 077
-  wg genkey | tee "${peer_priv_file}" | wg pubkey >"${peer_pub_file}"
-  peer_priv_key="$(cat "${peer_priv_file}")"
-  peer_pub_key="$(cat "${peer_pub_file}")"
-  server_pub_key="$(cat "${SERVER_PUB_FILE}")"
+  sudo mkdir -p "${peer_dir}"
+  sudo sh -c "umask 077 && wg genkey | tee '${peer_priv_file}' | wg pubkey >'${peer_pub_file}'"
+  peer_priv_key="$(sudo cat "${peer_priv_file}")"
+  peer_pub_key="$(sudo cat "${peer_pub_file}")"
+  server_pub_key="$(sudo cat "${SERVER_PUB_FILE}")"
   allowed_ips="$(allowed_ips_for_peer "${peer_ip}")"
 
   render_client_config "${peer_ip}" "${peer_name}" "${peer_priv_key}" "${server_pub_key}" "${allowed_ips}"
@@ -406,7 +425,7 @@ cmd_add() {
   printf "Client packages: %s.zip, %s.tar.gz\n" "${CLIENTS_DIR}/${peer_name}" "${CLIENTS_DIR}/${peer_name}"
 
   if [[ "${DISPLAY_QR}" == "true" ]]; then
-    qrencode -t ansiutf8 <"${peer_dir}/wg0.conf"
+    sudo cat "${peer_dir}/wg0.conf" | qrencode -t ansiutf8
   fi
 }
 
@@ -418,7 +437,7 @@ cmd_list() {
     [[ -z "${line}" ]] && continue
     printf "\t%s: %s\n" "${count}" "${line//,/$'\t'}"
     count=$((count + 1))
-  done <"${PEER_LIST_FILE}"
+  done < <(sudo cat "${PEER_LIST_FILE}" 2>/dev/null || true)
   echo
 }
 
@@ -430,8 +449,8 @@ cmd_remove() {
 
   remove_peer_everywhere "${RESOLVED_PEER_IP}" "${RESOLVED_PEER_NAME}" "${RESOLVED_PEER_PUB}"
   if [[ "${DELETE_FILES}" == "true" && -n "${RESOLVED_PEER_NAME}" ]]; then
-    rm -rf "${CLIENTS_DIR:?}/${RESOLVED_PEER_NAME}"
-    rm -f "${CLIENTS_DIR}/${RESOLVED_PEER_NAME}.zip" "${CLIENTS_DIR}/${RESOLVED_PEER_NAME}.tar.gz"
+    sudo rm -rf "${CLIENTS_DIR:?}/${RESOLVED_PEER_NAME}"
+    sudo rm -f "${CLIENTS_DIR}/${RESOLVED_PEER_NAME}.zip" "${CLIENTS_DIR}/${RESOLVED_PEER_NAME}.tar.gz"
   fi
 
   log_success "Removed peer '${RESOLVED_PEER_NAME:-${target}}'."
@@ -445,12 +464,12 @@ cmd_show() {
   fi
 
   local conf="${CLIENTS_DIR}/${peer_name}/wg0.conf"
-  if [[ ! -f "${conf}" ]]; then
+  if ! sudo test -f "${conf}"; then
     die "Client config not found: ${conf}"
   fi
-  cat "${conf}"
+  sudo cat "${conf}"
   if [[ "${DISPLAY_QR}" == "true" ]]; then
-    qrencode -t ansiutf8 <"${conf}"
+    sudo cat "${conf}" | qrencode -t ansiutf8
   fi
 }
 
@@ -470,7 +489,7 @@ cmd_status() {
   sudo wg show
 }
 
-while getopts "fhi:op:qs:t:vD" OPTION; do
+while getopts "fhi:op:qs:vD" OPTION; do
   case "${OPTION}" in
     f) FORCE="true" ;;
     h)
@@ -482,7 +501,6 @@ while getopts "fhi:op:qs:t:vD" OPTION; do
     p) CLI_SERVER_PORT="${OPTARG}" ;;
     q) DISPLAY_QR="true" ;;
     s) CLI_SERVER_IP="$(check_ip "${OPTARG}")" ;;
-    t) TOOL_DIR="${OPTARG}" ;;
     v) VERBOSE="true" ;;
     D) DELETE_FILES="true" ;;
     ?)

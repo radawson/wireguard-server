@@ -16,28 +16,36 @@ source "${LIB_FILE}"
 # Defaults
 ADAPTER="$(ip route | awk '/^default / {print $5; exit}')"
 BRANCH="main"
+CLIENT_ALLOWED_IPS="10.100.200.0/24"
 FORCE="false"
 RUN_UPDATES="false"
 OVERWRITE="false"
-INSTALL_DIRECTORY="/etc/wireguard"
 MA_MODE="false"
 SERVER_IP="10.100.200.1"
 SERVER_PORT="51820"
 SERVER_PRIVATE_FILE="server_key.pri"
 SERVER_PUBLIC_FILE="server_key.pub"
-TOOL_DIR="${HOME}/wireguard"
-CONFIG_DIR="${TOOL_DIR}/config"
-CONFIG_OVERRIDE="false"
 VERBOSE="false"
+
+INSTALL_DIRECTORY="${WG_DIR}"
+CONFIG_DIR="${WG_DIR}/config"
+SERVER_DIR="${WG_DIR}/server"
+CLIENTS_DIR="${WG_DIR}/clients"
+PEER_LIST_FILE="${WG_DIR}/peer_list.txt"
+LAST_IP_FILE="${WG_DIR}/last_ip.txt"
+SERVER_WG_CONF_PATH="${SERVER_DIR}/wg0.conf"
+INSTALLED_WG_CONF_PATH="${WG_DIR}/wg0.conf"
+WG_CLIENT_BIN="/usr/local/bin/wg-client"
+WG_SHARE_LIB="${WG_SHARE}/lib/common.sh"
+WG_SHARE_INSTALL_CLIENT="${WG_SHARE}/install-client.sh"
 
 usage() {
   cat <<EOF >&2
-Usage: ${0} [-dfhmouv] [-c CONFIG_DIR] [-i IP_RANGE] [-n KEY_NAME] [-p LISTEN_PORT] [-t TOOL_DIR]
+Usage: ${0} [-dfhmouv] [-i IP_RANGE] [-n KEY_NAME] [-p LISTEN_PORT]
 Sets up and starts a WireGuard server.
 Version: ${VERSION}
 
 Options:
-  -c CONFIG_DIR   Set configuration directory.
   -d              Use 'dev' branch metadata.
   -f              Force run as root.
   -h, --help      Show this help text.
@@ -46,7 +54,6 @@ Options:
   -n KEY_NAME     Set server key file name prefix.
   -o              Overwrite existing server keys/config.
   -p LISTEN_PORT  Set server listen port.
-  -t TOOL_DIR     Set tool installation directory.
   -u              Run apt update/dist-upgrade.
   -v              Verbose output.
 EOF
@@ -84,17 +91,30 @@ copy_if_changed() {
   install -m "${mode}" "${src}" "${dst}"
 }
 
+copy_if_changed_sudo() {
+  local src="$1"
+  local dst="$2"
+  local mode="${3:-0644}"
+
+  if [[ ! -f "${src}" ]]; then
+    die "Required source file missing: ${src}"
+  fi
+
+  if sudo test -f "${dst}" && sudo cmp -s "${src}" "${dst}"; then
+    echo_out "No changes for ${dst}"
+    return 0
+  fi
+
+  sudo install -m "${mode}" "${src}" "${dst}"
+}
+
 if [[ "${1:-}" == "--help" ]]; then
   usage
   exit 0
 fi
 
-while getopts "c:dfhi:mn:op:t:uv" OPTION; do
+while getopts "dfhi:mn:op:uv" OPTION; do
   case "${OPTION}" in
-    c)
-      CONFIG_DIR="${OPTARG}"
-      CONFIG_OVERRIDE="true"
-      ;;
     d)
       BRANCH="dev"
       ;;
@@ -110,6 +130,7 @@ while getopts "c:dfhi:mn:op:t:uv" OPTION; do
       ;;
     m)
       MA_MODE="true"
+      CLIENT_ALLOWED_IPS="0.0.0.0/0"
       ;;
     n)
       SERVER_PRIVATE_FILE="${OPTARG}.pri"
@@ -120,12 +141,6 @@ while getopts "c:dfhi:mn:op:t:uv" OPTION; do
       ;;
     p)
       SERVER_PORT="${OPTARG}"
-      ;;
-    t)
-      TOOL_DIR="${OPTARG}"
-      if [[ "${CONFIG_OVERRIDE}" != "true" ]]; then
-        CONFIG_DIR="${TOOL_DIR}/config"
-      fi
       ;;
     u)
       RUN_UPDATES="true"
@@ -158,14 +173,14 @@ install_package "wireguard-tools"
 install_package "zip"
 install_package "qrencode"
 
-mkdir -p "${TOOL_DIR}" "${CONFIG_DIR}" "${TOOL_DIR}/server" "${TOOL_DIR}/clients"
-mkdir -p "${TOOL_DIR}/lib"
 sudo mkdir -p -m 0700 "${INSTALL_DIRECTORY}"
+sudo mkdir -p "${CONFIG_DIR}" "${SERVER_DIR}" "${CLIENTS_DIR}" "${WG_SHARE}/lib"
 
-cat >"${TOOL_DIR}/server.conf" <<EOF
+cat <<EOF | sudo_write "${WG_CONF}" 0600
 VERSION="${VERSION}"
 ADAPTER="${ADAPTER}"
 BRANCH="${BRANCH}"
+CLIENT_ALLOWED_IPS="${CLIENT_ALLOWED_IPS}"
 FORCE="${FORCE}"
 INSTALL_DIRECTORY="${INSTALL_DIRECTORY}"
 MA_MODE="${MA_MODE}"
@@ -173,73 +188,62 @@ SERVER_IP="${SERVER_IP}"
 SERVER_PORT="${SERVER_PORT}"
 SERVER_PRIVATE_FILE="${SERVER_PRIVATE_FILE}"
 SERVER_PUBLIC_FILE="${SERVER_PUBLIC_FILE}"
-TOOL_DIR="${TOOL_DIR}"
 CONFIG_DIR="${CONFIG_DIR}"
 EOF
 
 log_info "Installing config templates..."
-copy_if_changed "${SCRIPT_DIR}/config/wg0-server.example.conf" "${CONFIG_DIR}/wg0-server.example.conf" 0644
-copy_if_changed "${SCRIPT_DIR}/config/wg0-client.example.conf" "${CONFIG_DIR}/wg0-client.example.conf" 0644
-copy_if_changed "${SCRIPT_DIR}/lib/common.sh" "${TOOL_DIR}/lib/common.sh" 0644
+copy_if_changed_sudo "${SCRIPT_DIR}/config/wg0-server.example.conf" "${CONFIG_DIR}/wg0-server.example.conf" 0644
+copy_if_changed_sudo "${SCRIPT_DIR}/config/wg0-client.example.conf" "${CONFIG_DIR}/wg0-client.example.conf" 0644
+copy_if_changed_sudo "${SCRIPT_DIR}/lib/common.sh" "${WG_SHARE_LIB}" 0644
+copy_if_changed_sudo "${SCRIPT_DIR}/tools/install-client.sh" "${WG_SHARE_INSTALL_CLIENT}" 0755
 
-server_key_pri_path="${TOOL_DIR}/server/${SERVER_PRIVATE_FILE}"
-server_key_pub_path="${TOOL_DIR}/server/${SERVER_PUBLIC_FILE}"
-server_wg_conf_path="${TOOL_DIR}/server/wg0.conf"
-installed_wg_conf_path="${INSTALL_DIRECTORY}/wg0.conf"
+server_key_pri_path="${SERVER_DIR}/${SERVER_PRIVATE_FILE}"
+server_key_pub_path="${SERVER_DIR}/${SERVER_PUBLIC_FILE}"
 
-if [[ "${OVERWRITE}" == "true" || ! -f "${server_key_pri_path}" || ! -f "${server_key_pub_path}" ]]; then
+if [[ "${OVERWRITE}" == "true" ]] || ! sudo test -f "${server_key_pri_path}" || ! sudo test -f "${server_key_pub_path}"; then
   log_info "Generating server key pair..."
-  umask 077
-  wg genkey | tee "${server_key_pri_path}" | wg pubkey >"${server_key_pub_path}"
+  sudo sh -c "umask 077 && wg genkey | tee '${server_key_pri_path}' | wg pubkey >'${server_key_pub_path}'"
 else
   log_info "Server key pair already exists; keeping existing keys."
 fi
 
-if [[ ! -s "${server_key_pri_path}" ]]; then
+if ! sudo test -s "${server_key_pri_path}"; then
   die "Server private key is missing or empty: ${server_key_pri_path}"
 fi
 
-SERVER_PRI_KEY="$(cat "${server_key_pri_path}")"
+SERVER_PRI_KEY="$(sudo cat "${server_key_pri_path}")"
 tmp_wg_conf="$(mktemp)"
-sed \
+sudo sed \
   -e "s|:SERVER_IP:|${SERVER_IP}|g" \
   -e "s|:SERVER_PORT:|${SERVER_PORT}|g" \
   -e "s|:SERVER_KEY:|${SERVER_PRI_KEY}|g" \
   -e "s|:ADAPTER:|${ADAPTER}|g" \
   "${CONFIG_DIR}/wg0-server.example.conf" >"${tmp_wg_conf}"
 
-if [[ "${OVERWRITE}" == "true" || ! -f "${server_wg_conf_path}" || ! -s "${server_wg_conf_path}" ]]; then
-  install -m 0600 "${tmp_wg_conf}" "${server_wg_conf_path}"
-  log_info "Generated ${server_wg_conf_path}"
-elif ! cmp -s "${tmp_wg_conf}" "${server_wg_conf_path}"; then
-  log_warn "Existing ${server_wg_conf_path} differs from template; preserving existing file (use -o to overwrite)."
+if [[ "${OVERWRITE}" == "true" ]] || ! sudo test -f "${SERVER_WG_CONF_PATH}" || ! sudo test -s "${SERVER_WG_CONF_PATH}"; then
+  sudo install -m 0600 "${tmp_wg_conf}" "${SERVER_WG_CONF_PATH}"
+  log_info "Generated ${SERVER_WG_CONF_PATH}"
+elif ! sudo cmp -s "${tmp_wg_conf}" "${SERVER_WG_CONF_PATH}"; then
+  log_warn "Existing ${SERVER_WG_CONF_PATH} differs from template; preserving existing file (use -o to overwrite)."
 else
   echo_out "Server config is already up-to-date."
 fi
 rm -f "${tmp_wg_conf}"
 
-sudo install -m 0600 "${server_wg_conf_path}" "${installed_wg_conf_path}"
+sudo install -m 0600 "${SERVER_WG_CONF_PATH}" "${INSTALLED_WG_CONF_PATH}"
 
-SERVER_PUB_KEY="$(cat "${server_key_pub_path}")"
-peer_list_file="${TOOL_DIR}/peer_list.txt"
-last_ip_file="${TOOL_DIR}/last_ip.txt"
-touch "${peer_list_file}"
+SERVER_PUB_KEY="$(sudo cat "${server_key_pub_path}")"
+sudo touch "${PEER_LIST_FILE}"
 
-if grep -qE "^${SERVER_IP},server," "${peer_list_file}"; then
-  sed -i "s|^${SERVER_IP},server,.*|${SERVER_IP},server,${SERVER_PUB_KEY}|" "${peer_list_file}"
+if sudo grep -qE "^${SERVER_IP},server," "${PEER_LIST_FILE}"; then
+  sudo sed -i "s|^${SERVER_IP},server,.*|${SERVER_IP},server,${SERVER_PUB_KEY}|" "${PEER_LIST_FILE}"
 else
-  printf "%s\n" "${SERVER_IP},server,${SERVER_PUB_KEY}" >>"${peer_list_file}"
+  printf "%s\n" "${SERVER_IP},server,${SERVER_PUB_KEY}" | sudo tee -a "${PEER_LIST_FILE}" >/dev/null
 fi
-printf "%s\n" "${SERVER_IP}" >"${last_ip_file}"
+printf "%s\n" "${SERVER_IP}" | sudo tee "${LAST_IP_FILE}" >/dev/null
 
 log_info "Installing tool scripts..."
-copy_if_changed "${SCRIPT_DIR}/tools/add-client.sh" "${TOOL_DIR}/add-client.sh" 0755
-copy_if_changed "${SCRIPT_DIR}/tools/install-client.sh" "${TOOL_DIR}/install-client.sh" 0755
-copy_if_changed "${SCRIPT_DIR}/tools/remove-client.sh" "${TOOL_DIR}/remove-client.sh" 0755
-copy_if_changed "${SCRIPT_DIR}/tools/wg-client.sh" "${TOOL_DIR}/wg-client.sh" 0755
-if ! sudo test -f "/usr/local/bin/wg-client" || ! sudo cmp -s "${SCRIPT_DIR}/tools/wg-client.sh" "/usr/local/bin/wg-client"; then
-  sudo install -m 0755 "${SCRIPT_DIR}/tools/wg-client.sh" "/usr/local/bin/wg-client"
-fi
+copy_if_changed_sudo "${SCRIPT_DIR}/tools/wg-client.sh" "${WG_CLIENT_BIN}" 0755
 
 log_info "Ensuring IPv4 forwarding is enabled..."
 echo 1 | sudo tee /proc/sys/net/ipv4/ip_forward >/dev/null
@@ -261,7 +265,7 @@ else
 fi
 
 if [[ "${MA_MODE}" == "true" ]]; then
-  if ! sudo ufw status | grep -q "ALLOW IN.*wg0"; then
+  if ! sudo ufw status | grep -q "in on wg0 out on ${ADAPTER}"; then
     sudo ufw route allow in on wg0 out on "${ADAPTER}"
   fi
 fi
@@ -270,7 +274,8 @@ sudo systemctl enable wg-quick@wg0.service >/dev/null
 
 log_success "WireGuard server setup complete."
 printf "\nServer details:\n"
-printf "  Tool directory: %s\n" "${TOOL_DIR}"
+printf "  Data directory: %s\n" "${WG_DIR}"
 printf "  Server IP:      %s\n" "${SERVER_IP}"
 printf "  Listen port:    %s\n" "${SERVER_PORT}"
 printf "  Public key:     %s\n\n" "${SERVER_PUB_KEY}"
+printf "Run `wg-client add <name>` to add a client.\n"

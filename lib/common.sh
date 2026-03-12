@@ -8,6 +8,9 @@ set -o pipefail
 
 # Defaults
 : "${VERBOSE:=false}"
+: "${WG_DIR:=/etc/wireguard}"
+: "${WG_CONF:=${WG_DIR}/wg-server.conf}"
+: "${WG_SHARE:=/usr/local/share/wireguard}"
 
 
 _supports_color() {
@@ -42,6 +45,16 @@ log_error() {
 
 log_success() {
   printf "%s[OK]%s %s\n" "${COLOR_GREEN}" "${COLOR_RESET}" "$*"
+}
+
+
+append_line_once() {
+  local line="$1"
+  local file="$2"
+  touch "${file}"
+  if ! grep -Fqx "${line}" "${file}"; then
+    printf "%s\n" "${line}" >>"${file}"
+  fi
 }
 
 echo_out() {
@@ -95,14 +108,6 @@ is_pkg_installed() {
   dpkg-query -W -f='${Status}' "${pkg}" 2>/dev/null | grep -q "install ok installed"
 }
 
-append_line_once() {
-  local line="$1"
-  local file="$2"
-  touch "${file}"
-  if ! grep -Fqx "${line}" "${file}"; then
-    printf "%s\n" "${line}" >>"${file}"
-  fi
-}
 
 replace_or_add_setting() {
   local key="$1"
@@ -115,4 +120,15 @@ replace_or_add_setting() {
   else
     printf "%s=%s\n" "${key}" "${value}" >>"${file}"
   fi
+}
+
+# Write stdin to root-owned file atomically.
+sudo_write() {
+  local target="$1"
+  local mode="${2:-0600}"
+  local tmp_file
+  tmp_file="$(mktemp)"
+  cat >"${tmp_file}"
+  sudo install -m "${mode}" "${tmp_file}" "${target}"
+  rm -f "${tmp_file}"
 }
