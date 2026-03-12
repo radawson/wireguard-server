@@ -1,325 +1,544 @@
 #!/bin/bash
-# Wireguard Client client handler
-# (C) 2021-2024 Richard Dawson
-VERSION="2.12.1"
+# WireGuard client/peer handler
+# (C) 2021-2026 Richard Dawson
+VERSION="2.13.0"
 
-## Global Variables
-ADAPTER=$(ip route | grep default | sed -e "s/^.*dev.//" -e "s/.proto.*//")
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_FILE="${SCRIPT_DIR}/../lib/common.sh"
+if [[ ! -f "${LIB_FILE}" ]]; then
+  LIB_FILE="${HOME}/wireguard/lib/common.sh"
+fi
+if [[ ! -f "${LIB_FILE}" ]]; then
+  printf "Missing required library file. Expected ../lib/common.sh or ~/wireguard/lib/common.sh\n" >&2
+  exit 1
+fi
+source "${LIB_FILE}"
+
 DISPLAY_QR="false"
 FORCE="false"
-FQDN=$(hostname -f)
 OVERWRITE="false"
-PATTERN=" |'"
+DELETE_FILES="false"
+VERBOSE="false"
+
+TOOL_DIR="${HOME}/wireguard"
 PEER_IP=""
 PEER_NAME=""
-RETURN_VALUE="" # Used to return values from a function
-SERVER_IP=$(ip -o route get to 1 | sed -n 's/.*src \([0-9.]\+\).*/\1/p')
-TOOL_DIR="${HOME}/wireguard"
-SERVER_PORT="$(grep ListenPort ${TOOL_DIR}/server/wg0.conf | sed 's/ListenPort = //')"
-MA_MODE=$(cat ${TOOL_DIR}/server.conf | grep MA_MODE | cut -c8)
+SERVER_IP=""
+SERVER_PORT=""
+MA_MODE="false"
 
-# Functions
-check_ip(){
-	local ip="$1"
+CLI_SERVER_IP=""
+CLI_SERVER_PORT=""
+CLI_MA_MODE=""
 
-    # Regular expression for validating IPv4 addresses
-    if [[ "$ip" =~ ^(([1-9]?[0-9]|1[0-9][0-9]|2([0-4][0-9]|5[0-5]))\.){3}([1-9]?[0-9]|1[0-9][0-9]|2([0-4][0-9]|5[0-5]))$ ]]; then
-        echo "$ip"  # Return the valid IP address
-    else
-        echo "Error: '$ip' is not a valid IP address." >&2
-        exit 1
-    fi
+SERVER_CONF_FILE=""
+SERVER_WG_CONF_FILE=""
+PEER_LIST_FILE=""
+LAST_IP_FILE=""
+CLIENTS_DIR=""
+SERVER_DIR=""
+CLIENT_TEMPLATE=""
+SERVER_PUB_FILE=""
+INSTALL_CLIENT_SCRIPT=""
+
+usage() {
+  cat <<EOF >&2
+Usage: ${0} [options] <command> [peer_name|peer_public_key]
+Manage WireGuard clients/peers.
+
+Commands:
+  add <peer_name>      Create client config and register peer
+  list                 List known peers
+  remove <target>      Remove peer by name or public key
+  show [peer_name]     Show one client config (or all peers if omitted)
+  update <peer_name>   Recreate keys/config for existing peer (keeps IP)
+  status               Show wg interface status
+  help                 Show this help
+
+Options:
+  -f              Force run as root.
+  -h              Show help.
+  -i IP_ADDRESS   Set/override peer IP (for add/update).
+  -o              Overwrite existing client.
+  -p SERVER_PORT  Set server listen port.
+  -q              Display QR code on screen.
+  -s SERVER_IP    Set server public endpoint IP.
+  -t TOOL_DIR     Set tool installation directory.
+  -v              Verbose output.
+  -D              Delete client files on remove.
+EOF
 }
 
-check_root() {
-  # Check to ensure script is not run as root
-  if [[ "${UID}" -eq 0 ]]; then
-    UNAME=$(id -un)
-    printf "\nThis script should not be run as root.\n\n" >&2
-    usage
+refresh_paths() {
+  SERVER_CONF_FILE="${TOOL_DIR}/server.conf"
+  SERVER_WG_CONF_FILE="/etc/wireguard/wg0.conf"
+  PEER_LIST_FILE="${TOOL_DIR}/peer_list.txt"
+  LAST_IP_FILE="${TOOL_DIR}/last_ip.txt"
+  CLIENTS_DIR="${TOOL_DIR}/clients"
+  SERVER_DIR="${TOOL_DIR}/server"
+  CLIENT_TEMPLATE="${TOOL_DIR}/config/wg0-client.example.conf"
+  SERVER_PUB_FILE="${SERVER_DIR}/server_key.pub"
+  INSTALL_CLIENT_SCRIPT="${TOOL_DIR}/install-client.sh"
+}
+
+load_server_conf() {
+  refresh_paths
+  if [[ -f "${SERVER_CONF_FILE}" ]]; then
+    # shellcheck disable=SC1090
+    source "${SERVER_CONF_FILE}"
+  fi
+
+  SERVER_IP="${SERVER_IP:-$(ip -o route get to 1 | awk '{for (i=1; i<=NF; i++) if ($i=="src") print $(i+1)}' | head -n1)}"
+  if [[ -z "${SERVER_PORT:-}" && -f "${TOOL_DIR}/server/wg0.conf" ]]; then
+    SERVER_PORT="$(awk -F'=' '/^ListenPort/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "${TOOL_DIR}/server/wg0.conf")"
+  fi
+  SERVER_PORT="${SERVER_PORT:-51820}"
+  MA_MODE="${MA_MODE:-false}"
+
+  if [[ -n "${CLI_SERVER_IP}" ]]; then
+    SERVER_IP="${CLI_SERVER_IP}"
+  fi
+  if [[ -n "${CLI_SERVER_PORT}" ]]; then
+    SERVER_PORT="${CLI_SERVER_PORT}"
+  fi
+  if [[ -n "${CLI_MA_MODE}" ]]; then
+    MA_MODE="${CLI_MA_MODE}"
   fi
 }
 
-check_string() {
-  if [[ "$1" =~ ${PATTERN} ]]; then
-    echo "Spaces found for ${2}"
-    echo "This may cause issues"
+ensure_layout() {
+  mkdir -p "${CLIENTS_DIR}" "${SERVER_DIR}"
+  touch "${PEER_LIST_FILE}"
+}
+
+allowed_ips_for_peer() {
+  local peer_ip="$1"
+  if [[ "${MA_MODE}" == "true" ]]; then
+    printf "0.0.0.0/0\n"
+  else
+    printf "%s/24\n" "$(awk -F. '{print $1"."$2"."$3".0"}' <<<"${peer_ip}")"
+  fi
+}
+
+next_peer_ip() {
+  local base_ip
+  local base
+  local last_octet
+  local candidate
+
+  base_ip="${SERVER_IP:-10.100.200.1}"
+  base="$(awk -F. '{print $1"."$2"."$3}' <<<"${base_ip}")"
+  last_octet="$(awk -F. '{print $4}' "${LAST_IP_FILE}" 2>/dev/null || true)"
+  if [[ -z "${last_octet}" || ! "${last_octet}" =~ ^[0-9]+$ ]]; then
+    last_octet="$(awk -F. '{print $4}' <<<"${base_ip}")"
+  fi
+  candidate=$((last_octet + 1))
+
+  while [[ "${candidate}" -le 254 ]]; do
+    if ! grep -q "^${base}\.${candidate}," "${PEER_LIST_FILE}" 2>/dev/null; then
+      printf "%s.%s\n" "${base}" "${candidate}"
+      return 0
+    fi
+    candidate=$((candidate + 1))
+  done
+
+  die "No free IP addresses left in ${base}.0/24"
+}
+
+set_last_ip() {
+  local ip="$1"
+  printf "%s\n" "${ip}" >"${LAST_IP_FILE}"
+}
+
+resolve_peer() {
+  local target="$1"
+  local mode
+
+  RESOLVED_PEER_IP=""
+  RESOLVED_PEER_NAME=""
+  RESOLVED_PEER_PUB=""
+
+  if [[ "${target}" == *"=" ]]; then
+    mode="pub"
+  else
+    mode="name"
+  fi
+
+  while IFS=, read -r ip name pub; do
+    [[ -z "${ip}" ]] && continue
+    if [[ "${mode}" == "pub" && "${pub}" == "${target}" ]]; then
+      RESOLVED_PEER_IP="${ip}"
+      RESOLVED_PEER_NAME="${name}"
+      RESOLVED_PEER_PUB="${pub}"
+      return 0
+    fi
+    if [[ "${mode}" == "name" && "${name}" == "${target}" ]]; then
+      RESOLVED_PEER_IP="${ip}"
+      RESOLVED_PEER_NAME="${name}"
+      RESOLVED_PEER_PUB="${pub}"
+      return 0
+    fi
+  done <"${PEER_LIST_FILE}"
+
+  if [[ "${mode}" == "name" && -f "${CLIENTS_DIR}/${target}/${target}.pub" ]]; then
+    RESOLVED_PEER_NAME="${target}"
+    RESOLVED_PEER_PUB="$(cat "${CLIENTS_DIR}/${target}/${target}.pub")"
+    RESOLVED_PEER_IP="$(awk -F, -v p="${RESOLVED_PEER_PUB}" '$3==p {print $1; exit}' "${PEER_LIST_FILE}" 2>/dev/null || true)"
+    return 0
+  fi
+
+  return 1
+}
+
+remove_peer_block_from_server_conf() {
+  local peer_pub="$1"
+  local tmp_file
+  tmp_file="$(mktemp)"
+
+  sudo awk -v key="${peer_pub}" '
+  function flush_block() {
+    if (n == 0) return
+    if (!skip) {
+      for (i = 1; i <= n; i++) print block[i]
+    }
+    n = 0
+    skip = 0
+  }
+  {
+    if ($0 == "[Peer]") {
+      flush_block()
+      in_peer = 1
+      n = 1
+      block[n] = $0
+      next
+    }
+
+    if (in_peer) {
+      n++
+      block[n] = $0
+      if ($0 ~ /^PublicKey[[:space:]]*=/) {
+        line = $0
+        sub(/^PublicKey[[:space:]]*=[[:space:]]*/, "", line)
+        gsub(/[[:space:]]/, "", line)
+        if (line == key) skip = 1
+      }
+      next
+    }
+
+    print
+  }
+  END {
+    flush_block()
+  }' "${SERVER_WG_CONF_FILE}" >"${tmp_file}"
+
+  sudo install -m 0600 "${tmp_file}" "${SERVER_WG_CONF_FILE}"
+  rm -f "${tmp_file}"
+}
+
+remove_from_peer_list() {
+  local peer_ip="$1"
+  local peer_name="$2"
+  local peer_pub="$3"
+  local tmp_file
+  tmp_file="$(mktemp)"
+  awk -F, -v ip="${peer_ip}" -v name="${peer_name}" -v pub="${peer_pub}" '
+    !($1==ip || $2==name || $3==pub) {print}
+  ' "${PEER_LIST_FILE}" >"${tmp_file}"
+  mv "${tmp_file}" "${PEER_LIST_FILE}"
+}
+
+add_to_peer_list() {
+  local peer_ip="$1"
+  local peer_name="$2"
+  local peer_pub="$3"
+  remove_from_peer_list "${peer_ip}" "${peer_name}" "${peer_pub}"
+  printf "%s,%s,%s\n" "${peer_ip}" "${peer_name}" "${peer_pub}" >>"${PEER_LIST_FILE}"
+}
+
+update_hosts_entry() {
+  local peer_ip="$1"
+  local peer_name="$2"
+  local add="${3:-true}"
+  local tmp_file
+  tmp_file="$(mktemp)"
+  sudo awk -v ip="${peer_ip}" -v name="${peer_name}" '
+    !($1==ip || $2==name) {print}
+  ' /etc/hosts >"${tmp_file}"
+  if [[ "${add}" == "true" ]]; then
+    printf "%s %s\n" "${peer_ip}" "${peer_name}" >>"${tmp_file}"
+  fi
+  sudo install -m 0644 "${tmp_file}" /etc/hosts
+  rm -f "${tmp_file}"
+}
+
+render_client_config() {
+  local peer_ip="$1"
+  local peer_name="$2"
+  local peer_priv_key="$3"
+  local server_pub_key="$4"
+  local allowed_ips="$5"
+  local out_file="${CLIENTS_DIR}/${peer_name}/wg0.conf"
+
+  if [[ ! -f "${CLIENT_TEMPLATE}" ]]; then
+    die "Missing client template: ${CLIENT_TEMPLATE}"
+  fi
+
+  sed \
+    -e "s|:CLIENT_IP:|${peer_ip}|g" \
+    -e "s|:CLIENT_KEY:|${peer_priv_key}|g" \
+    -e "s|:SERVER_PUB_KEY:|${server_pub_key}|g" \
+    -e "s|:SERVER_ADDRESS:|${SERVER_IP}|g" \
+    -e "s|:SERVER_PORT:|${SERVER_PORT}|g" \
+    -e "s|:ALLOWED_IPS:/24|${allowed_ips}|g" \
+    -e "s|:ALLOWED_IPS:|${allowed_ips}|g" \
+    "${CLIENT_TEMPLATE}" >"${out_file}"
+}
+
+package_client_files() {
+  require_cmd qrencode zip tar
+  local peer_name="$1"
+  local client_dir="${CLIENTS_DIR}/${peer_name}"
+  qrencode -o "${client_dir}/${peer_name}.png" <"${client_dir}/wg0.conf"
+  cp -f "${INSTALL_CLIENT_SCRIPT}" "${client_dir}/install-client.sh"
+  rm -f "${CLIENTS_DIR}/${peer_name}.zip" "${CLIENTS_DIR}/${peer_name}.tar.gz"
+  zip -rq "${CLIENTS_DIR}/${peer_name}.zip" "${client_dir}"
+  tar -czf "${CLIENTS_DIR}/${peer_name}.tar.gz" -C "${CLIENTS_DIR}" "${peer_name}"
+}
+
+ensure_server_peer_block() {
+  local peer_ip="$1"
+  local peer_pub="$2"
+  if ! sudo grep -q "PublicKey = ${peer_pub}" "${SERVER_WG_CONF_FILE}"; then
+    {
+      printf "\n[Peer]\n"
+      printf "PublicKey = %s\n" "${peer_pub}"
+      printf "AllowedIPs = %s/32\n" "${peer_ip}"
+    } | sudo tee -a "${SERVER_WG_CONF_FILE}" >/dev/null
+  fi
+}
+
+remove_peer_everywhere() {
+  local peer_ip="$1"
+  local peer_name="$2"
+  local peer_pub="$3"
+
+  if [[ -n "${peer_pub}" ]]; then
+    sudo wg set wg0 peer "${peer_pub}" remove >/dev/null 2>&1 || true
+    if sudo test -f "${SERVER_WG_CONF_FILE}"; then
+      remove_peer_block_from_server_conf "${peer_pub}"
+    fi
+  fi
+
+  if [[ -f "${PEER_LIST_FILE}" ]]; then
+    remove_from_peer_list "${peer_ip}" "${peer_name}" "${peer_pub}"
+  fi
+
+  if [[ -n "${peer_ip}" || -n "${peer_name}" ]]; then
+    update_hosts_entry "${peer_ip}" "${peer_name}" "false"
   fi
 }
 
 cmd_add() {
-  # Get server listen port
-  SERVER_PORT="$(grep ListenPort ${TOOL_DIR}/server/wg0.conf | sed 's/ListenPort = //')"
+  local peer_name="$1"
+  local peer_ip="${PEER_IP}"
+  local peer_dir peer_priv_file peer_pub_file peer_priv_key peer_pub_key server_pub_key allowed_ips
 
-  # Check peer name
-  check_string "${@}" "PEER_NAME"
-  PEER_NAME="${@}"
+  check_string "${peer_name}" "PEER_NAME"
+  ensure_layout
 
-  # Check if peer config already exists
-  if [[ "${OVERWRITE}" -ne "true" ]]; then
-    if [[ -f "${TOOL_DIR}/clients/${PEER_NAME}/wg0.conf" ]]; then
-      echo -e "\nConfig for client ${PEER_NAME} found.\n\n"
-      cat "${TOOL_DIR}/clients/${PEER_NAME}/wg0.conf"
-      # Show QR code on console
-      if [[ "${DISPLAY_QR}" == "true" ]]; then
-        qrencode -t ansiutf8 <"${TOOL_DIR}"/clients/${PEER_NAME}/wg0.conf
+  if resolve_peer "${peer_name}"; then
+    if [[ "${OVERWRITE}" != "true" ]]; then
+      log_warn "Client '${peer_name}' already exists. Use -o to overwrite."
+      [[ -f "${CLIENTS_DIR}/${peer_name}/wg0.conf" ]] && cat "${CLIENTS_DIR}/${peer_name}/wg0.conf"
+      if [[ "${DISPLAY_QR}" == "true" && -f "${CLIENTS_DIR}/${peer_name}/wg0.conf" ]]; then
+        qrencode -t ansiutf8 <"${CLIENTS_DIR}/${peer_name}/wg0.conf"
       fi
-      echo
-      read -p "Overwrite existing config? [y/N] " YESNO
-      if [[ "${YESNO}" == "y" || "${YESNO}" == "Y" ]]; then
-        return
-      else
-        exit 10
-      fi
+      return 0
     fi
+    if [[ -z "${peer_ip}" ]]; then
+      peer_ip="${RESOLVED_PEER_IP}"
+    fi
+    remove_peer_everywhere "${RESOLVED_PEER_IP}" "${RESOLVED_PEER_NAME}" "${RESOLVED_PEER_PUB}"
   fi
 
-  echo_out "Creating client config for: ${PEER_NAME}"
-  mkdir -p ${TOOL_DIR}/clients/"${PEER_NAME}"
-  wg genkey | (umask 0077 && tee "${TOOL_DIR}/clients/${PEER_NAME}/${PEER_NAME}.pri") | wg pubkey >"${TOOL_DIR}/clients/${PEER_NAME}/${PEER_NAME}".pub
-
-  # get command line ip address or generated from last-ip.txt
-  if [ -z "${PEER_IP}" ]; then
-    PEER_IP="10.100.200."$(expr $(cat "${TOOL_DIR}"/last_ip.txt | tr "." " " | awk '{print $4}') + 1)
-    sudo echo "${PEER_IP}" >"${TOOL_DIR}"/last_ip.txt
-  fi
-
-  #Try to get server IP address
-  if [[ ${SERVER_IP} == "" ]]; then
-    echo "Server IP not found automatically. Update wg0.conf before sending to clients"
-    SERVER_IP="<Insert IP ADDRESS HERE>"
-  fi
-
-  SERVER_PUB_KEY=$(cat "${TOOL_DIR}"/server/server_key.pub)
-
-  # Set IP routing range as ALLOWED_IPS
-  if [[ MA_MODE == "true" ]]; then
-    ALLOWED_IPS="0.0.0.0"
+  if [[ -z "${peer_ip}" ]]; then
+    peer_ip="$(next_peer_ip)"
   else
-    ALLOWED_IPS=$(echo ${PEER_IP} | cut -d"." -f1-3).0
+    peer_ip="$(check_ip "${peer_ip}")"
   fi
 
-  # Create the client config
-  PEER_PRIV_KEY=$(cat ${TOOL_DIR}/clients/${PEER_NAME}/${PEER_NAME}.pri)
-  cat ${TOOL_DIR}/config/wg0-client.example.conf |
-    sed -e 's/:CLIENT_IP:/'"${PEER_IP}"'/' |
-    sed -e 's|:CLIENT_KEY:|'"${PEER_PRIV_KEY}"'|' |
-    sed -e 's/:ALLOWED_IPS:/'"${ALLOWED_IPS}"'/' |
-    sed -e 's|:SERVER_PUB_KEY:|'"${SERVER_PUB_KEY}"'|' |
-    sed -e 's|:SERVER_ADDRESS:|'"${SERVER_IP}"'|' |
-    sed -e 's|:SERVER_PORT:|'"${SERVER_PORT}"'|' \
-    >clients/${PEER_NAME}/wg0.conf
+  if [[ -z "${SERVER_IP}" ]]; then
+    die "Server IP could not be resolved. Use -s to set one."
+  fi
+  if [[ ! -f "${SERVER_PUB_FILE}" ]]; then
+    die "Missing server public key file: ${SERVER_PUB_FILE}"
+  fi
+  if [[ ! -f "${INSTALL_CLIENT_SCRIPT}" ]]; then
+    die "Missing install-client script in tool directory: ${INSTALL_CLIENT_SCRIPT}"
+  fi
 
-  cp ${TOOL_DIR}/install-client.sh ${TOOL_DIR}/clients/${PEER_NAME}/install-client.sh
+  peer_dir="${CLIENTS_DIR}/${peer_name}"
+  peer_priv_file="${peer_dir}/${peer_name}.pri"
+  peer_pub_file="${peer_dir}/${peer_name}.pub"
+  mkdir -p "${peer_dir}"
 
-  # Create QR Code for export
-  qrencode -o ${TOOL_DIR}/clients/${PEER_NAME}/${PEER_NAME}.png <${TOOL_DIR}/clients/${PEER_NAME}/wg0.conf
+  umask 077
+  wg genkey | tee "${peer_priv_file}" | wg pubkey >"${peer_pub_file}"
+  peer_priv_key="$(cat "${peer_priv_file}")"
+  peer_pub_key="$(cat "${peer_pub_file}")"
+  server_pub_key="$(cat "${SERVER_PUB_FILE}")"
+  allowed_ips="$(allowed_ips_for_peer "${peer_ip}")"
 
-  # Compress file contents into packages
-  zip -r ${TOOL_DIR}/clients/${PEER_NAME}.zip ${TOOL_DIR}/clients/${PEER_NAME}
-  tar czvf ${TOOL_DIR}/clients/${PEER_NAME}.tar.gz ${TOOL_DIR}/clients/${PEER_NAME}
-  echo_out "Created config files"
+  render_client_config "${peer_ip}" "${peer_name}" "${peer_priv_key}" "${server_pub_key}" "${allowed_ips}"
+  package_client_files "${peer_name}"
 
-  # Add peer information to the tracking files
-  echo
-  echo_out "Adding peer ${PEER_NAME} to peer list from /clients"
-  PEER_PRIV_KEY=$(cat ${TOOL_DIR}/clients/${PEER_NAME}/${PEER_NAME}.pri)
-  PEER_PUB_KEY=$(cat ${TOOL_DIR}/clients/${PEER_NAME}/${PEER_NAME}.pub)
-  ADD_LINE="${PEER_IP},${PEER_NAME},${PEER_PUB_KEY}"
-  echo "${ADD_LINE}" >>${TOOL_DIR}/peer_list.txt
-  echo "${PEER_IP}" >${TOOL_DIR}/last_ip.txt
+  add_to_peer_list "${peer_ip}" "${peer_name}" "${peer_pub_key}"
+  set_last_ip "${peer_ip}"
 
-  # Add peer to server config
-  echo_out "Adding peer to server peer list"
-  PEER_CONFIG="\n[Peer]\nPublicKey = ${PEER_PUB_KEY} \nAllowedIPs = ${PEER_IP}"
-  printf "${PEER_CONFIG}" | sudo tee -a /etc/wireguard/wg0.conf
+  ensure_server_peer_block "${peer_ip}" "${peer_pub_key}"
+  sudo wg set wg0 peer "${peer_pub_key}" allowed-ips "${peer_ip}/32"
+  update_hosts_entry "${peer_ip}" "${peer_name}" "true"
 
-  # Add peer through the live interface to be sure
-  sudo wg set wg0 peer "${PEER_PUB_KEY}" allowed-ips ${PEER_IP}/32
-  echo_out "Adding peer to hosts file"
-  echo "${PEER_IP} ${PEER_NAME}" | sudo tee -a /etc/hosts
+  log_success "Client '${peer_name}' created/updated."
+  printf "Client config: %s\n" "${peer_dir}/wg0.conf"
+  printf "Client packages: %s.zip, %s.tar.gz\n" "${CLIENTS_DIR}/${peer_name}" "${CLIENTS_DIR}/${peer_name}"
+
+  if [[ "${DISPLAY_QR}" == "true" ]]; then
+    qrencode -t ansiutf8 <"${peer_dir}/wg0.conf"
+  fi
 }
 
 cmd_list() {
+  ensure_layout
   printf "\nCurrent Clients:\n"
-  local -i COUNT=1
+  local count=1
   while IFS= read -r line; do
-    echo -e "\t${COUNT}: ${line}" | sed 's/,/\t/g'
-    COUNT=${COUNT}+1
-  done <"${TOOL_DIR}/peer_list.txt"
+    [[ -z "${line}" ]] && continue
+    printf "\t%s: %s\n" "${count}" "${line//,/$'\t'}"
+    count=$((count + 1))
+  done <"${PEER_LIST_FILE}"
   echo
 }
 
 cmd_remove() {
-  if [[ $(echo "${1: -1}") == "=" ]]; then
-    wg_server=$(sudo wg show)
-    if [[ "${wg_server}" == *"$1"* ]]; then
-      peer_pub_key=$1
-    else
-      echo "Public key" $1 "not valid"
-      exit 1
-    fi
-  else
-    echo "Removing" $1
-    # Check to see if client exists
-    if [ -f clients/$1/wg0.conf ]; then
-      peer_pub_key=$(cat clients/$1/$1.pub)
-    else
-      echo "Can't find config for client" $1
-      exit 1
-    fi
-
-    printf "\nRemoving ${1}\n\n"
-    sudo wg set wg0 peer $peer_pub_key remove
+  local target="$1"
+  if ! resolve_peer "${target}"; then
+    die "Could not resolve peer '${target}' by name or public key."
   fi
+
+  remove_peer_everywhere "${RESOLVED_PEER_IP}" "${RESOLVED_PEER_NAME}" "${RESOLVED_PEER_PUB}"
+  if [[ "${DELETE_FILES}" == "true" && -n "${RESOLVED_PEER_NAME}" ]]; then
+    rm -rf "${CLIENTS_DIR:?}/${RESOLVED_PEER_NAME}"
+    rm -f "${CLIENTS_DIR}/${RESOLVED_PEER_NAME}.zip" "${CLIENTS_DIR}/${RESOLVED_PEER_NAME}.tar.gz"
+  fi
+
+  log_success "Removed peer '${RESOLVED_PEER_NAME:-${target}}'."
 }
 
 cmd_show() {
-  local PEER_NAME="${1}"
-  # Display QR code for client
-  if [[ "${DISPLAY_QR}" == "true" ]]; then
-    qrencode -t ansiutf8 <"${TOOL_DIR}"/clients/${PEER_NAME}/wg0.conf
+  local peer_name="${1:-}"
+  if [[ -z "${peer_name}" ]]; then
+    sudo wg show
+    return 0
   fi
-  printf "\n\nShow command goes here\n"
+
+  local conf="${CLIENTS_DIR}/${peer_name}/wg0.conf"
+  if [[ ! -f "${conf}" ]]; then
+    die "Client config not found: ${conf}"
+  fi
+  cat "${conf}"
+  if [[ "${DISPLAY_QR}" == "true" ]]; then
+    qrencode -t ansiutf8 <"${conf}"
+  fi
 }
 
 cmd_update() {
-  printf "\n\nUpdate command goes here\n"
-}
-
-echo_out() {
-  local MESSAGE="${@}"
-  if [[ -t 0 ]]; then
-    # No pipe, just print the arguments
-    if [[ "${VERBOSE}" = 'true' ]]; then
-      printf "${MESSAGE}\n"
-    fi
-  else
-    # Read from pipe and print if VERBOSE is true
-    if [[ "${VERBOSE}" = 'true' ]]; then
-      while IFS= read -r line; do
-        printf "${line}\n"
-      done
-    fi
+  local peer_name="$1"
+  if ! resolve_peer "${peer_name}"; then
+    die "Peer '${peer_name}' not found."
   fi
+  OVERWRITE="true"
+  if [[ -z "${PEER_IP}" ]]; then
+    PEER_IP="${RESOLVED_PEER_IP}"
+  fi
+  cmd_add "${peer_name}"
 }
 
-usage() {
-  echo "Usage: ${0} [-fhov] [-i IP_ADDRESS] [ ADD | LIST | REMOVE | SHOW | UPDATE ] PEER_NAME" >&2
-  echo "Client/peer handler for wireguard server."
-  echo
-  echo "-f 		Force run as root. WARNING: may have unexpected results!"
-  echo "-i IP_ADDRESS	Set the peer ip address."
-  echo "-o 		Overwrite existing client configuration."
-  echo "-p SERVER_PORT	Set the server listen port."
-  echo "-q		Display QR code on screen."
-  echo "-s SERVER_IP	Set the server ip address."
-  echo "-t TOOL_DIR	Set the tool installation directory."
-  echo "-v 		Verbose mode. Displays the server name before executing COMMAND."
+cmd_status() {
+  sudo wg show
 }
 
-## MAIN ##
-# Provide usage statement if no parameters
-while getopts hi:op:qs:t:v OPTION; do
-  case ${OPTION} in
-  f)
-    # Force the script to run as root
-    FORCE='true'
-    echo_out "WARNING! Script is running as root."
-    ;;
-  h)
-    # Help = display usage
-    usage
-    ;;
-  i)
-    # Set IP address if none specified
-    PEER_IP="${OPTARG}"
-    echo_out "Client WireGuard IP address is ${IP_ADDRESS}"
-    ;;
-  o)
-    # Set overwrite to true
-    OVERWRITE="true"
-    ;;
-  p)
-    # Set server port
-    SERVER_PORT="${OPTARG}"
-    echo_out "Server port set to ${OPTARG}"
-    ;;
-  q)
-    # Display QR code on screen
-    DISPLAY_QR="true"
-    echo_out "Display QR code on screen."
-    ;;
-  s)
-    # Set Server IP address
-    SERVER_IP="${OPTARG}"
-    echo_out "Server IP address set to ${OPTARG}"
-    ;;
-  t)
-    # Set IP address if none specified
-    TOOL_DIR="${OPTARG}"
-    echo_out "Tool Directory is ${TOOL_DIR}"
-    ;;
-  v)
-    # Verbose is first so any other elements will echo as well
-    VERBOSE='true'
-    echo_out "Verbose mode on."
-    ;;
-  ?) ;;
-
+while getopts "fhi:op:qs:t:vD" OPTION; do
+  case "${OPTION}" in
+    f) FORCE="true" ;;
+    h)
+      usage
+      exit 0
+      ;;
+    i) PEER_IP="$(check_ip "${OPTARG}")" ;;
+    o) OVERWRITE="true" ;;
+    p) CLI_SERVER_PORT="${OPTARG}" ;;
+    q) DISPLAY_QR="true" ;;
+    s) CLI_SERVER_IP="$(check_ip "${OPTARG}")" ;;
+    t) TOOL_DIR="${OPTARG}" ;;
+    v) VERBOSE="true" ;;
+    D) DELETE_FILES="true" ;;
+    ?)
+      usage
+      exit 1
+      ;;
   esac
 done
-
-# Check if forcing to run as root
-if [[ "${FORCE}" != "true" ]]; then
-  check_root
-fi
-
-# Clear the options from the arguments
 shift "$((OPTIND - 1))"
 
-echo ${@}
-
-if [[ $# -eq 0 ]]; then
-  usage
-  exit 0
-fi
-
-# menu logic
-
-if [[ ${#} -eq 1 ]]; then
-  COMMAND=$(echo ${1} | tr '[:upper:]' '[:lower:]')
-  case $COMMAND in
-  help)
-    usage
-    ;;
-  list)
-    cmd_list
-    exit 0
-    ;;
-  show)
-    cmd_show ${2}
-    exit 0
-    ;;
-  *)
-    echo "Invalid option" >&2
-    usage
-    exit 1
-    ;;
-  esac
-elif [[ ${#} -eq 2 && ${1} == "add" ]]; then
-  shift "$((OPTIND - 1))"
-  echo ${@}
-  cmd_add ${@}
-else
+command="${1:-}"
+if [[ -z "${command}" ]]; then
   usage
   exit 1
 fi
-
-# Show new server config
-sudo wg show
-
-# Show QR code on console
-if [[ "${DISPLAY_QR}" == "true" ]]; then
-  qrencode -t ansiutf8 <"${TOOL_DIR}"/clients/${PEER_NAME}/wg0.conf
+if [[ "${command}" == "help" ]]; then
+  usage
+  exit 0
 fi
+shift || true
+
+if [[ "${FORCE}" != "true" ]]; then
+  check_root usage
+fi
+
+require_cmd awk sed wg
+load_server_conf
+ensure_layout
+
+case "${command}" in
+  add)
+    [[ $# -ge 1 ]] || die "add requires a peer name"
+    PEER_NAME="$1"
+    cmd_add "${PEER_NAME}"
+    ;;
+  list)
+    cmd_list
+    ;;
+  remove)
+    [[ $# -ge 1 ]] || die "remove requires peer name or public key"
+    cmd_remove "$1"
+    ;;
+  show)
+    cmd_show "${1:-}"
+    ;;
+  update)
+    [[ $# -ge 1 ]] || die "update requires a peer name"
+    cmd_update "$1"
+    ;;
+  status)
+    cmd_status
+    ;;
+  help)
+    usage
+    ;;
+  *)
+    die "Unknown command '${command}'. Use 'help' to list commands."
+    ;;
+esac

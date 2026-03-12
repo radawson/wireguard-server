@@ -1,16 +1,24 @@
 #!/bin/bash
-# Install wireguard on Ubuntu Server
-# (C) 2021-2024 Richard Dawson
-VERSION="2.12.1"
+# Install WireGuard on Ubuntu/Debian server
+# (C) 2021-2026 Richard Dawson
+VERSION="2.13.0"
 
-# Ubuntu 18.04
-#sudo add-apt-repository ppa:wireguard/wireguard
+set -euo pipefail
 
-# Default variables
-# Change these if you need to
-ADAPTER=$(ip route | grep default | sed -e "s/^.*dev.//" -e "s/.proto.*//")
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_FILE="${SCRIPT_DIR}/lib/common.sh"
+if [[ ! -f "${LIB_FILE}" ]]; then
+  printf "Missing required library: %s\n" "${LIB_FILE}" >&2
+  exit 1
+fi
+source "${LIB_FILE}"
+
+# Defaults
+ADAPTER="$(ip route | awk '/^default / {print $5; exit}')"
 BRANCH="main"
 FORCE="false"
+RUN_UPDATES="false"
+OVERWRITE="false"
 INSTALL_DIRECTORY="/etc/wireguard"
 MA_MODE="false"
 SERVER_IP="10.100.200.1"
@@ -19,162 +27,142 @@ SERVER_PRIVATE_FILE="server_key.pri"
 SERVER_PUBLIC_FILE="server_key.pub"
 TOOL_DIR="${HOME}/wireguard"
 CONFIG_DIR="${TOOL_DIR}/config"
-START_DIR=$(pwd)
+CONFIG_OVERRIDE="false"
+VERBOSE="false"
 
-# Functions
-check_ip(){
-	local ip="$1"
-	
-    # Regular expression for validating IPv4 addresses
-    if [[ "$ip" =~ ^(([1-9]?[0-9]|1[0-9][0-9]|2([0-4][0-9]|5[0-5]))\.){3}([1-9]?[0-9]|1[0-9][0-9]|2([0-4][0-9]|5[0-5]))$ ]]; then
-        echo "$ip"  # Return the valid IP address
-    else
-        echo "Error: '$ip' is not a valid IP address." >&2
-        exit 1
-    fi
+usage() {
+  cat <<EOF >&2
+Usage: ${0} [-dfhmouv] [-c CONFIG_DIR] [-i IP_RANGE] [-n KEY_NAME] [-p LISTEN_PORT] [-t TOOL_DIR]
+Sets up and starts a WireGuard server.
+Version: ${VERSION}
+
+Options:
+  -c CONFIG_DIR   Set configuration directory.
+  -d              Use 'dev' branch metadata.
+  -f              Force run as root.
+  -h, --help      Show this help text.
+  -i IP_RANGE     Set server WireGuard IP address.
+  -m              Route all traffic through WireGuard server.
+  -n KEY_NAME     Set server key file name prefix.
+  -o              Overwrite existing server keys/config.
+  -p LISTEN_PORT  Set server listen port.
+  -t TOOL_DIR     Set tool installation directory.
+  -u              Run apt update/dist-upgrade.
+  -v              Verbose output.
+EOF
 }
 
-check_root() {
-	# Check to ensure script is not run as root
-	if [[ "${UID}" -eq 0 ]]; then
-		UNAME=$(id -un)
-		printf "\nThis script should not be run as root.\n\n" >&2
-		usage
-	fi
+cleanup() {
+  :
 }
+trap cleanup EXIT
 
-echo_out() {
-  local MESSAGE="${@}"
-  if [[ -t 0 ]]; then
-    # No pipe, just print the arguments
-    if [[ "${VERBOSE}" = 'true' ]]; then
-      printf "${MESSAGE}\n"
-    fi
+install_package() {
+  local pkg="$1"
+  if is_pkg_installed "${pkg}"; then
+    echo_out "Package '${pkg}' already installed."
   else
-    # Read from pipe and print if VERBOSE is true
-    if [[ "${VERBOSE}" = 'true' ]]; then
-      while IFS= read -r line; do
-        printf "${line}\n"
-      done
-    fi
+    log_info "Installing package: ${pkg}"
+    sudo apt-get -y install "${pkg}"
   fi
 }
 
-usage() {
-	echo "Usage: ${0} [-dfhv] [-c CONFIG_DIR] [-i IP_RANGE] [-n KEY_NAME] [-p LISTEN_PORT] [-t TOOL_DIR]" >&2
-	echo "Sets up and starts wireguard server."
-	echo
-	echo "-c CONFIG_DIR	Set configuration directory."
-	echo "-d 		Run 'dev' branch. WARNING: may have unexpected results!"
-	echo "-f 		Force run as root. WARNING: may have unexpected results!"
-	echo "-h		Help displays script usage information."
-	echo "-i IP_RANGE	Set the server network IP range."
-	echo "-m		Route all traffic through wireguard Server."
-	echo "-n KEY_NAME	Set the server key file name."
-	echo "-p LISTEN_PORT	Set the server listen port"
-	echo "-t TOOL_DIR	Set tool installation directory."
-	echo "-v 		Verbose mode."
-	exit 1
+copy_if_changed() {
+  local src="$1"
+  local dst="$2"
+  local mode="${3:-0644}"
+
+  if [[ ! -f "${src}" ]]; then
+    die "Required source file missing: ${src}"
+  fi
+
+  if [[ -f "${dst}" ]] && cmp -s "${src}" "${dst}"; then
+    echo_out "No changes for ${dst}"
+    return 0
+  fi
+
+  install -m "${mode}" "${src}" "${dst}"
 }
 
-## MAIN ##
-# Provide usage statement if no parameters
-while getopts c:dfhi:mn:p:t:v OPTION; do
-	case ${OPTION} in
-	c)
-		# Verbose is first so any other elements will echo as well
-		CONFIG_DIR="${OPTARG}"
-		echo_out "Configuration directory set to ${CONFIG_DIR}"
-		;;
-	d)
-		# Set installation to dev branch
-		BRANCH="dev"
-		echo_out "Branch set to dev branch"
-		;;
-	f)
-		# Force the script to run as root
-		FORCE='true'
-		;;
-	h)
-		# Help = display usage
-		usage
-		;;
-	i)
-		# Set IP range if none specified
-		SERVER_IP=$(check_ip "${OPTARG}")
-		echo_out "Internal server IP address is ${SERVER_IP}"
-		;;
-	m)
-		# Activate MA mode, which routes ALL traffic through WG server
-		MA_MODE="true"
-		;;
-	n)
-		# Set the key file name
-		SERVER_PRIVATE_FILE="${OPTARG}.pri"
-		SERVER_PUBLIC_FILE="${OPTARG}.pub"
-		echo_out "Server key file named ${OPTARG}."
-		;;
-	p)
-		# Set the server listen port
-		SERVER_PORT="${OPTARG}"
-		echo_out "Server listen port set to ${OPTARG}."
-		;;
-	t)
-		# Set tool installation directory
-		TOOL_DIRECTORY="${OPTARG}"
-		echo_out "Tool installation directory set to ${TOOL_DIR}."
-		;;
-	v)
-		# Verbose is first so any other elements will echo as well
-		VERBOSE='true'
-		echo_out "Verbose mode on."
-		;;
-	?)
-		echo "invalid option" >&2
-		usage
-		;;
-	esac
-done
-
-# Check if forcing to run as root
-if [[ "${FORCE}" != "true" ]]; then
-	check_root
+if [[ "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
 fi
 
-# Clear the options from the arguments
+while getopts "c:dfhi:mn:op:t:uv" OPTION; do
+  case "${OPTION}" in
+    c)
+      CONFIG_DIR="${OPTARG}"
+      CONFIG_OVERRIDE="true"
+      ;;
+    d)
+      BRANCH="dev"
+      ;;
+    f)
+      FORCE="true"
+      ;;
+    h)
+      usage
+      exit 0
+      ;;
+    i)
+      SERVER_IP="$(check_ip "${OPTARG}")"
+      ;;
+    m)
+      MA_MODE="true"
+      ;;
+    n)
+      SERVER_PRIVATE_FILE="${OPTARG}.pri"
+      SERVER_PUBLIC_FILE="${OPTARG}.pub"
+      ;;
+    o)
+      OVERWRITE="true"
+      ;;
+    p)
+      SERVER_PORT="${OPTARG}"
+      ;;
+    t)
+      TOOL_DIR="${OPTARG}"
+      if [[ "${CONFIG_OVERRIDE}" != "true" ]]; then
+        CONFIG_DIR="${TOOL_DIR}/config"
+      fi
+      ;;
+    u)
+      RUN_UPDATES="true"
+      ;;
+    v)
+      VERBOSE="true"
+      ;;
+    ?)
+      usage
+      exit 1
+      ;;
+  esac
+done
 shift "$((OPTIND - 1))"
 
-# OS Update
-echo_out "Updating the OS."
-sudo apt-get update
-sudo apt-get -y dist-upgrade
-
-# Install wireguard
-if [[ -z $(apt list --installed | grep ^wireguard) ]]; then
-	echo_out "Installing WireGuard"
-	sudo apt-get -y install wireguard
-	sudo apt-get -y install wireguard-tools
+if [[ "${FORCE}" != "true" ]]; then
+  check_root usage
 fi
-echo_out "WireGuard installed"
 
-# Install zip
-if [[ -z $(apt list --installed | grep ^zip) ]]; then
-	echo_out "Installing zip."
-	sudo apt-get -y install zip
+require_cmd awk cmp install ip sed wg
+
+if [[ "${RUN_UPDATES}" == "true" ]]; then
+  log_info "Running apt update/dist-upgrade..."
+  sudo apt-get update
+  sudo apt-get -y dist-upgrade
 fi
-echo_out "Zip installed."
 
-# Install QR Encoder
-echo_out "Installing QR encoder."
-sudo apt-get install -y qrencode
-echo_out "QR encoder installed."
+install_package "wireguard"
+install_package "wireguard-tools"
+install_package "zip"
+install_package "qrencode"
 
-# Create tool directory
-echo_out "Creating tool directory"
-mkdir -p "${CONFIG_DIR}"
+mkdir -p "${TOOL_DIR}" "${CONFIG_DIR}" "${TOOL_DIR}/server" "${TOOL_DIR}/clients"
+mkdir -p "${TOOL_DIR}/lib"
+sudo mkdir -p -m 0700 "${INSTALL_DIRECTORY}"
 
-# Write the config file
-cat > ${TOOL_DIR}/server.conf <<_EOF
+cat >"${TOOL_DIR}/server.conf" <<EOF
 VERSION="${VERSION}"
 ADAPTER="${ADAPTER}"
 BRANCH="${BRANCH}"
@@ -187,110 +175,102 @@ SERVER_PRIVATE_FILE="${SERVER_PRIVATE_FILE}"
 SERVER_PUBLIC_FILE="${SERVER_PUBLIC_FILE}"
 TOOL_DIR="${TOOL_DIR}"
 CONFIG_DIR="${CONFIG_DIR}"
-_EOF
+EOF
 
-# Get config templates
-echo_out "Downloading WG adapter config files..."
-cd "${TOOL_DIR}"/config
-wget https://raw.githubusercontent.com/radawson/wireguard-server/${BRANCH}/config/wg0-server.example.conf
-wget https://raw.githubusercontent.com/radawson/wireguard-server/${BRANCH}/config/wg0-client.example.conf
-echo_out "WG adapter config files downloaded."
+log_info "Installing config templates..."
+copy_if_changed "${SCRIPT_DIR}/config/wg0-server.example.conf" "${CONFIG_DIR}/wg0-server.example.conf" 0644
+copy_if_changed "${SCRIPT_DIR}/config/wg0-client.example.conf" "${CONFIG_DIR}/wg0-client.example.conf" 0644
+copy_if_changed "${SCRIPT_DIR}/lib/common.sh" "${TOOL_DIR}/lib/common.sh" 0644
 
-# Create server directory
-mkdir -p "${TOOL_DIR}"/server
+server_key_pri_path="${TOOL_DIR}/server/${SERVER_PRIVATE_FILE}"
+server_key_pub_path="${TOOL_DIR}/server/${SERVER_PUBLIC_FILE}"
+server_wg_conf_path="${TOOL_DIR}/server/wg0.conf"
+installed_wg_conf_path="${INSTALL_DIRECTORY}/wg0.conf"
 
-# Create Server Keys
-echo_out "Creating server keys."
-cd "${TOOL_DIR}"/server
-if [ -f ${INSTALL_DIRECTORY}/wg0.conf ]; then
-	echo "${INSTALL_DIRECTORY}/wg0.conf exists"
-	echo "This process could over-write existing keys!"
-	echo
-	while true; do
-		read -p "Do you wish to overwrite existing keys?" yn
-		case $yn in
-		[Yy]*)
-			OVERWRITE=1
-			break
-			;;
-		[Nn]*)
-			OVERWRITE=0
-			break
-			;;
-		*) echo "Please answer y or n." ;;
-		esac
-	done
+if [[ "${OVERWRITE}" == "true" || ! -f "${server_key_pri_path}" || ! -f "${server_key_pub_path}" ]]; then
+  log_info "Generating server key pair..."
+  umask 077
+  wg genkey | tee "${server_key_pri_path}" | wg pubkey >"${server_key_pub_path}"
 else
-	echo "Creating ${INSTALL_DIRECTORY}"
-	sudo mkdir -m 0700 ${INSTALL_DIRECTORY}
+  log_info "Server key pair already exists; keeping existing keys."
 fi
 
-# Check for a pre-existing installation
-if [ -f ${SERVER_PRIVATE_FILE} ] && [ ${OVERWRITE} == 0 ]; then
-	echo "${SERVER_PRIVATE_FILE} exists, skipping."
+if [[ ! -s "${server_key_pri_path}" ]]; then
+  die "Server private key is missing or empty: ${server_key_pri_path}"
+fi
+
+SERVER_PRI_KEY="$(cat "${server_key_pri_path}")"
+tmp_wg_conf="$(mktemp)"
+sed \
+  -e "s|:SERVER_IP:|${SERVER_IP}|g" \
+  -e "s|:SERVER_PORT:|${SERVER_PORT}|g" \
+  -e "s|:SERVER_KEY:|${SERVER_PRI_KEY}|g" \
+  -e "s|:ADAPTER:|${ADAPTER}|g" \
+  "${CONFIG_DIR}/wg0-server.example.conf" >"${tmp_wg_conf}"
+
+if [[ "${OVERWRITE}" == "true" || ! -f "${server_wg_conf_path}" || ! -s "${server_wg_conf_path}" ]]; then
+  install -m 0600 "${tmp_wg_conf}" "${server_wg_conf_path}"
+  log_info "Generated ${server_wg_conf_path}"
+elif ! cmp -s "${tmp_wg_conf}" "${server_wg_conf_path}"; then
+  log_warn "Existing ${server_wg_conf_path} differs from template; preserving existing file (use -o to overwrite)."
 else
-	umask 077
-	wg genkey | tee ${SERVER_PRIVATE_FILE} | wg pubkey >${SERVER_PUBLIC_FILE}
+  echo_out "Server config is already up-to-date."
 fi
+rm -f "${tmp_wg_conf}"
 
-# Check if wg0.conf already exists
-echo_out "Building custom configuration files..."
-if [ -f ${TOOL_DIR}/server/wg0.conf ] && [ ${OVERWRITE} == 0 ]; then
-	echo_out "${TOOL_DIR}/server/wg0.conf exists, skipping."
+sudo install -m 0600 "${server_wg_conf_path}" "${installed_wg_conf_path}"
+
+SERVER_PUB_KEY="$(cat "${server_key_pub_path}")"
+peer_list_file="${TOOL_DIR}/peer_list.txt"
+last_ip_file="${TOOL_DIR}/last_ip.txt"
+touch "${peer_list_file}"
+
+if grep -qE "^${SERVER_IP},server," "${peer_list_file}"; then
+  sed -i "s|^${SERVER_IP},server,.*|${SERVER_IP},server,${SERVER_PUB_KEY}|" "${peer_list_file}"
 else
-	# Add server key to config
-	SERVER_PRI_KEY=$(cat ${TOOL_DIR}/server/${SERVER_PRIVATE_FILE})
-	cat ${CONFIG_DIR}/wg0-server.example.conf | sed -e 's/:SERVER_IP:/'"${SERVER_IP}"'/' | sed -e 's/:SERVER_PORT:/'"${SERVER_PORT}"'/' | sed -e 's|:SERVER_KEY:|'"${SERVER_PRI_KEY}"'|' >"${TOOL_DIR}"/server/wg0.conf
-	echo_out "Private key added to configuration."
+  printf "%s\n" "${SERVER_IP},server,${SERVER_PUB_KEY}" >>"${peer_list_file}"
+fi
+printf "%s\n" "${SERVER_IP}" >"${last_ip_file}"
+
+log_info "Installing tool scripts..."
+copy_if_changed "${SCRIPT_DIR}/tools/add-client.sh" "${TOOL_DIR}/add-client.sh" 0755
+copy_if_changed "${SCRIPT_DIR}/tools/install-client.sh" "${TOOL_DIR}/install-client.sh" 0755
+copy_if_changed "${SCRIPT_DIR}/tools/remove-client.sh" "${TOOL_DIR}/remove-client.sh" 0755
+copy_if_changed "${SCRIPT_DIR}/tools/wg-client.sh" "${TOOL_DIR}/wg-client.sh" 0755
+if ! sudo test -f "/usr/local/bin/wg-client" || ! sudo cmp -s "${SCRIPT_DIR}/tools/wg-client.sh" "/usr/local/bin/wg-client"; then
+  sudo install -m 0755 "${SCRIPT_DIR}/tools/wg-client.sh" "/usr/local/bin/wg-client"
 fi
 
-# Copy wg0.conf to /etc/wireguard
-sudo cp "${TOOL_DIR}"/server/wg0.conf /etc/wireguard/wg0.conf
+log_info "Ensuring IPv4 forwarding is enabled..."
+echo 1 | sudo tee /proc/sys/net/ipv4/ip_forward >/dev/null
+sudo sed -i 's|^#\?net.ipv4.ip_forward=.*|net.ipv4.ip_forward=1|' /etc/sysctl.conf
+sudo sysctl -p >/dev/null
 
-# Change to tool directory
-cd ${TOOL_DIR}
-
-# Add server IP to last-ip.txt file
-SERVER_PUB_KEY=$(cat ${TOOL_DIR}/server/${SERVER_PUBLIC_FILE})
-ADD_LINE="${SERVER_IP},server,${SERVER_PUB_KEY}"
-echo "${ADD_LINE}" >>${TOOL_DIR}/peer_list.txt
-echo "${SERVER_IP}" >${TOOL_DIR}/last_ip.txt
-
-# Download tool scripts
-echo_out "Downloading tool scripts"
-wget https://raw.githubusercontent.com/radawson/wireguard-server/${BRANCH}/tools/add-client.sh
-wget https://raw.githubusercontent.com/radawson/wireguard-server/${BRANCH}/tools/install-client.sh
-wget https://raw.githubusercontent.com/radawson/wireguard-server/${BRANCH}/tools/remove-client.sh
-wget https://raw.githubusercontent.com/radawson/wireguard-server/${BRANCH}/tools/wg-client.sh
-sudo chmod 755 *.sh
-sudo cp wg-client.sh /usr/local/bin/wg-client
-rm wg-client.sh
-echo_out "Tool scripts installed to ${TOOL_DIR}"
-
-# Start up server
-echo "Server Starting..."
-sudo sysctl -p
-echo 1 | sudo tee /proc/sys/net/ipv4//ip_forward
-
-sudo wg-quick up wg0
-
-# Open firewall ports
-echo_out "Open firewall port ${SERVER_PORT}"
-sudo ufw allow "${SERVER_PORT}"/udp
-echo "Server started"
-
-if [[ ${MA_MODE} == "true" ]]; then
-	# Use this to forward traffic from the server
-	sudo sed -i 's/#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/g' /etc/sysctl.conf
-	sudo sysctl -p 
-    sudo ufw route allow in on wg0 out on ${ADAPTER}
+if ! sudo wg show wg0 >/dev/null 2>&1; then
+  log_info "Starting WireGuard interface wg0..."
+  sudo wg-quick up wg0
+else
+  log_info "WireGuard interface wg0 already active; skipping wg-quick up."
 fi
 
-# Set up wireguard to run on boot
-sudo systemctl enable wg-quick@wg0.service
+if ! sudo ufw status | grep -q "${SERVER_PORT}/udp"; then
+  log_info "Opening firewall port ${SERVER_PORT}/udp"
+  sudo ufw allow "${SERVER_PORT}/udp"
+else
+  echo_out "Firewall rule for ${SERVER_PORT}/udp already exists."
+fi
 
-# Clean up
-cd ${START_DIR}
-rm -- "$(readlink -f -- "${BASH_SOURCE[0]:-$0}" 2>'/dev/null')"
+if [[ "${MA_MODE}" == "true" ]]; then
+  if ! sudo ufw status | grep -q "ALLOW IN.*wg0"; then
+    sudo ufw route allow in on wg0 out on "${ADAPTER}"
+  fi
+fi
 
-printf "\n\nWireguard tools installed at ${TOOL_DIR}.\n"
+sudo systemctl enable wg-quick@wg0.service >/dev/null
+
+log_success "WireGuard server setup complete."
+printf "\nServer details:\n"
+printf "  Tool directory: %s\n" "${TOOL_DIR}"
+printf "  Server IP:      %s\n" "${SERVER_IP}"
+printf "  Listen port:    %s\n" "${SERVER_PORT}"
+printf "  Public key:     %s\n\n" "${SERVER_PUB_KEY}"

@@ -1,30 +1,105 @@
 #!/bin/bash
-# Install instructions for clients created by add-client.sh
-# (C) 2021 Richard Dawson 
-# v1.0.0
+# Install instructions for client bundles created by wg-client
+# (C) 2021-2026 Richard Dawson
 
-# Ubuntu 18.04
-#sudo add-apt-repository ppa:wireguard/wireguard
+set -euo pipefail
 
-# Debian
-#echo "deb http://deb.debian.org/debian/ unstable main" > /etc/apt/sources.list.d/unstable-wireguard.list
-#printf 'Package: *\nPin: release a=unstable\nPin-Priority: 150\n' > /etc/apt/preferences.d/limit-unstable
+RUN_UPDATES="false"
+FORCE="false"
+CONF_SOURCE="./wg0.conf"
+VERBOSE="false"
 
-#Both
-sudo apt-get update
-sudo apt-get -y install wireguard
-sudo apt-get -y install wireguard-tools
+usage() {
+  cat <<EOF >&2
+Usage: ${0} [-fhuv] [-c CONF_FILE]
+Install/refresh WireGuard client config on this host.
 
-# put wg0.conf in `/etc/wireguard/`
-sudo cp wg0.conf /etc/wireguard/wg0.conf
+Options:
+  -c CONF_FILE  Path to client config file (default: ./wg0.conf)
+  -f            Force run as root.
+  -h            Show help.
+  -u            Run apt update before package install.
+  -v            Verbose output.
+EOF
+}
 
-# DNS Resolver commands (may be required)
-#sudo ln -s /usr/bin/resolvectl /usr/local/bin/resolvconf
-#sudo systemctl enable systemd-resolved.service
+log() {
+  if [[ "${VERBOSE}" == "true" ]]; then
+    printf "%s\n" "$*"
+  fi
+}
 
-# start wireguard wg0
-sudo wg-quick up wg0
+is_pkg_installed() {
+  local pkg="$1"
+  dpkg-query -W -f='${Status}' "${pkg}" 2>/dev/null | grep -q "install ok installed"
+}
 
-# set wireguard wg0 to start on boot
-sudo systemctl enable wg-quick@wg0.service 
+install_package() {
+  local pkg="$1"
+  if is_pkg_installed "${pkg}"; then
+    log "Package '${pkg}' already installed."
+  else
+    log "Installing '${pkg}'..."
+    sudo apt-get -y install "${pkg}"
+  fi
+}
+
+check_root() {
+  if [[ "${UID}" -eq 0 ]]; then
+    printf "This script should not be run as root (unless -f is used).\n" >&2
+    exit 1
+  fi
+}
+
+while getopts "c:fhuv" OPTION; do
+  case "${OPTION}" in
+    c) CONF_SOURCE="${OPTARG}" ;;
+    f) FORCE="true" ;;
+    h)
+      usage
+      exit 0
+      ;;
+    u) RUN_UPDATES="true" ;;
+    v) VERBOSE="true" ;;
+    ?)
+      usage
+      exit 1
+      ;;
+  esac
+done
+shift "$((OPTIND - 1))"
+
+if [[ "${FORCE}" != "true" ]]; then
+  check_root
+fi
+
+[[ -f "${CONF_SOURCE}" ]] || {
+  printf "Configuration file not found: %s\n" "${CONF_SOURCE}" >&2
+  exit 1
+}
+
+if [[ "${RUN_UPDATES}" == "true" ]]; then
+  sudo apt-get update
+fi
+
+install_package "wireguard"
+install_package "wireguard-tools"
+
+sudo mkdir -p /etc/wireguard
+if ! sudo test -f /etc/wireguard/wg0.conf || ! sudo cmp -s "${CONF_SOURCE}" /etc/wireguard/wg0.conf; then
+  sudo install -m 0600 "${CONF_SOURCE}" /etc/wireguard/wg0.conf
+  log "Installed new /etc/wireguard/wg0.conf"
+else
+  log "Existing /etc/wireguard/wg0.conf is already up-to-date."
+fi
+
+if ! sudo wg show wg0 >/dev/null 2>&1; then
+  sudo wg-quick up wg0
+  log "Started wg0 interface."
+else
+  log "wg0 is already up."
+fi
+
+sudo systemctl enable wg-quick@wg0.service >/dev/null
+printf "WireGuard client installation complete.\n"
 

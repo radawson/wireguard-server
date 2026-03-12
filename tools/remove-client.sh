@@ -1,106 +1,73 @@
 #!/bin/bash
-# Add Wireguard Client to Ubuntu Server
-# (C) 2021 Richard Dawson
-# v2.0.0
+# Backward-compatible wrapper for wg-client remove
+# (C) 2021-2026 Richard Dawson
 
-## Global Variables
-FQDN=$(hostname -f)
-PATTERN=" |'"
-PEER_IP=""
-PEER_NAME=""
-TOOL_DIR="${HOME}/wireguard"
+set -euo pipefail
 
-# Functions
-check_root() {
-  # Check to ensure script is not run as root
-  if [[ "${UID}" -eq 0 ]]; then
-    UNAME=$(id -un)
-    printf "\nThis script must not be run as root.\n\n" >&2
-    usage
-  fi
-}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_FILE="${SCRIPT_DIR}/../lib/common.sh"
+if [[ ! -f "${LIB_FILE}" ]]; then
+  LIB_FILE="${HOME}/wireguard/lib/common.sh"
+fi
+if [[ ! -f "${LIB_FILE}" ]]; then
+  printf "Missing required library file. Expected ../lib/common.sh or ~/wireguard/lib/common.sh\n" >&2
+  exit 1
+fi
+source "${LIB_FILE}"
 
-check_string() {
-  if [[ "$1" =~ ${PATTERN} ]]   
-  then
-    echo "Spaces found for ${2}"
-	echo "This may cause issues"
-  fi
-}
-
-echo_out() {
-  local MESSAGE="${@}"
-  if [[ "${VERBOSE}" = 'true' ]]; then
-    printf "${MESSAGE}\n"
-  fi
-}
+WG_CLIENT="${SCRIPT_DIR}/wg-client.sh"
+if [[ ! -f "${WG_CLIENT}" ]]; then
+  WG_CLIENT="${HOME}/wireguard/wg-client.sh"
+fi
 
 usage() {
-  echo "Usage: ${0} [-dv] [-t TOOL_DIR] PEER_NAME" >&2
-  echo "Creates a new client on the wireguard server."
-  echo "Do not run as root."
-  echo "-d			Delete config files"
-  echo "-t TOOL_DIR	Set the tool installation directory."
-  echo "-v 			Verbose mode. Displays the server name before executing COMMAND."
-  exit 1
+  cat <<EOF >&2
+Usage: ${0} [options] PEER_NAME_OR_PUBLIC_KEY
+Compatibility wrapper for: wg-client remove
+
+Options:
+  -d              Delete client files and archives.
+  -f              Force run as root.
+  -h              Show help.
+  -t TOOL_DIR     Override tool directory.
+  -v              Verbose output.
+EOF
 }
 
-## MAIN ##
-check_root
-# Provide usage statement if no parameters
-while getopts dvt: OPTION; do
-  case ${OPTION} in
-    v)
-      # Verbose is first so any other elements will echo as well
-      VERBOSE='true'
-      echo_out "Verbose mode on."
+FORWARD_ARGS=()
+DELETE_FILES="false"
+
+while getopts "dfht:v" OPTION; do
+  case "${OPTION}" in
+    d) DELETE_FILES="true" ;;
+    f|t|v)
+      FORWARD_ARGS+=("-${OPTION}")
+      if [[ "${OPTION}" == "t" ]]; then
+        FORWARD_ARGS+=("${OPTARG}")
+      fi
       ;;
-    d)
-	# Delete configuration files
-      PEER_IP="${OPTARG}"
-      echo_out "Client WireGuard IP address is ${IP_ADDRESS}"
-      ;;
-	t)
-	# Set IP address if none specified
-      TOOL_DIR="${OPTARG}"
-      echo_out "Tool Directory is ${TOOL_DIR}"
+    h)
+      usage
+      exit 0
       ;;
     ?)
-      echo "Invalid option" >&2
       usage
+      exit 1
       ;;
   esac
 done
+shift "$((OPTIND - 1))"
 
-# Clear the options from the arguments
-shift "$(( OPTIND - 1 ))"
+[[ -f "${WG_CLIENT}" ]] || die "Unable to find wg-client.sh"
 
-if [ $# -eq 0 ]
-then
-	echo "You must specify a valid client name or public key"
-	sudo wg show
-	exit 1
-elif [ $(echo "${1: -1}") == "=" ] 
-then
-	wg_server=$(sudo wg show)
-	if [[ "${wg_server}" == *"$1"* ]]
-	then
-		peer_pub_key=$1
-	else
-		echo "Public key" $1 "not valid"
-		exit 1
-	fi
-else
-	echo "Removing" $1
-	# Check to see if client exists
-	if [ -f clients/$1/wg0.conf ]
-	then
-		peer_pub_key=$(cat clients/$1/$1.pub)
-	else
-		echo "Can't find config for client" $1
-		exit 1
-	fi
+[[ $# -ge 1 ]] || {
+  usage
+  exit 1
+}
+
+TARGET="$1"
+if [[ "${DELETE_FILES}" == "true" ]]; then
+  FORWARD_ARGS+=("-D")
 fi
-echo "Removing" $1
-sudo wg set wg0 peer $peer_pub_key remove
-sudo wg show
+
+exec bash "${WG_CLIENT}" "${FORWARD_ARGS[@]}" remove "${TARGET}"
