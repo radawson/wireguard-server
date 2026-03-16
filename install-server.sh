@@ -1,15 +1,51 @@
 #!/bin/bash
 # Install WireGuard on Ubuntu/Debian server
 # (C) 2021-2026 Richard Dawson
-VERSION="2.13.0"
+VERSION="2.13.1"
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LIB_FILE="${SCRIPT_DIR}/lib/common.sh"
-if [[ ! -f "${LIB_FILE}" ]]; then
-  printf "Missing required library: %s\n" "${LIB_FILE}" >&2
-  exit 1
+LIB_FILE_LOCAL="${SCRIPT_DIR}/lib/common.sh"
+LIB_FILE_INSTALLED="/usr/local/share/wireguard/lib/common.sh"
+RAW_REPO_BASE="${WG_REPO_RAW_BASE:-https://raw.githubusercontent.com/radawson/wireguard-server}"
+RAW_BRANCH="${WG_REPO_BRANCH:-main}"
+for arg in "$@"; do
+  if [[ "${arg}" == "-d" ]]; then
+    RAW_BRANCH="dev"
+    break
+  fi
+done
+
+DOWNLOAD_TMP_DIR="$(mktemp -d)"
+download_raw_file() {
+  local rel_path="$1"
+  local out_path="$2"
+  local raw_url="${RAW_REPO_BASE}/${RAW_BRANCH}/${rel_path}"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "${raw_url}" -o "${out_path}"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "${out_path}" "${raw_url}"
+  else
+    printf "Missing downloader: install curl or wget.\n" >&2
+    exit 1
+  fi
+}
+
+COMMON_SOURCE_FILE=""
+if [[ -f "${LIB_FILE_LOCAL}" ]]; then
+  LIB_FILE="${LIB_FILE_LOCAL}"
+  COMMON_SOURCE_FILE="${LIB_FILE_LOCAL}"
+elif [[ -f "${LIB_FILE_INSTALLED}" ]]; then
+  LIB_FILE="${LIB_FILE_INSTALLED}"
+  COMMON_SOURCE_FILE="${LIB_FILE_INSTALLED}"
+else
+  LIB_FILE="${DOWNLOAD_TMP_DIR}/common.sh"
+  if ! download_raw_file "lib/common.sh" "${LIB_FILE}"; then
+    printf "Failed to download lib/common.sh from %s/%s\n" "${RAW_REPO_BASE}" "${RAW_BRANCH}" >&2
+    exit 1
+  fi
+  COMMON_SOURCE_FILE="${LIB_FILE}"
 fi
 source "${LIB_FILE}"
 
@@ -65,7 +101,7 @@ EOF
 }
 
 cleanup() {
-  :
+  rm -rf "${DOWNLOAD_TMP_DIR}"
 }
 trap cleanup EXIT
 
@@ -111,6 +147,19 @@ copy_if_changed_sudo() {
   fi
 
   sudo install -m "${mode}" "${src}" "${dst}"
+}
+
+resolve_repo_source() {
+  local rel_path="$1"
+  local local_path="${SCRIPT_DIR}/${rel_path}"
+  local out_path="${DOWNLOAD_TMP_DIR}/${rel_path##*/}"
+  if [[ -f "${local_path}" ]]; then
+    printf "%s\n" "${local_path}"
+    return 0
+  fi
+  log_warn "Missing local file '${local_path}', downloading from ${RAW_REPO_BASE}/${RAW_BRANCH}/${rel_path}"
+  download_raw_file "${rel_path}" "${out_path}" || die "Failed downloading '${rel_path}' from GitHub raw."
+  printf "%s\n" "${out_path}"
 }
 
 if [[ "${1:-}" == "--help" ]]; then
@@ -202,10 +251,14 @@ CONFIG_DIR="${CONFIG_DIR}"
 EOF
 
 log_info "Installing config templates..."
-copy_if_changed_sudo "${SCRIPT_DIR}/config/wg0-server.example.conf" "${CONFIG_DIR}/wg0-server.example.conf" 0644
-copy_if_changed_sudo "${SCRIPT_DIR}/config/wg0-client.example.conf" "${CONFIG_DIR}/wg0-client.example.conf" 0644
-copy_if_changed_sudo "${SCRIPT_DIR}/lib/common.sh" "${WG_SHARE_LIB}" 0644
-copy_if_changed_sudo "${SCRIPT_DIR}/tools/install-client.sh" "${WG_SHARE_INSTALL_CLIENT}" 0755
+SERVER_TEMPLATE_SOURCE="$(resolve_repo_source "config/wg0-server.example.conf")"
+CLIENT_TEMPLATE_SOURCE="$(resolve_repo_source "config/wg0-client.example.conf")"
+INSTALL_CLIENT_SOURCE="$(resolve_repo_source "tools/install-client.sh")"
+WG_CLIENT_SOURCE="$(resolve_repo_source "tools/wg-client.sh")"
+copy_if_changed_sudo "${SERVER_TEMPLATE_SOURCE}" "${CONFIG_DIR}/wg0-server.example.conf" 0644
+copy_if_changed_sudo "${CLIENT_TEMPLATE_SOURCE}" "${CONFIG_DIR}/wg0-client.example.conf" 0644
+copy_if_changed_sudo "${COMMON_SOURCE_FILE}" "${WG_SHARE_LIB}" 0644
+copy_if_changed_sudo "${INSTALL_CLIENT_SOURCE}" "${WG_SHARE_INSTALL_CLIENT}" 0755
 
 server_key_pri_path="${SERVER_DIR}/${SERVER_PRIVATE_FILE}"
 server_key_pub_path="${SERVER_DIR}/${SERVER_PUBLIC_FILE}"
@@ -253,7 +306,7 @@ fi
 printf "%s\n" "${SERVER_IP}" | sudo tee "${LAST_IP_FILE}" >/dev/null
 
 log_info "Installing tool scripts..."
-copy_if_changed_sudo "${SCRIPT_DIR}/tools/wg-client.sh" "${WG_CLIENT_BIN}" 0755
+copy_if_changed_sudo "${WG_CLIENT_SOURCE}" "${WG_CLIENT_BIN}" 0755
 
 log_info "Ensuring IPv4 forwarding is enabled..."
 echo 1 | sudo tee /proc/sys/net/ipv4/ip_forward >/dev/null
