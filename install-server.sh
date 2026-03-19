@@ -218,7 +218,7 @@ if [[ "${FORCE}" != "true" ]]; then
   check_root usage
 fi
 
-require_cmd awk cmp install ip sed wg
+require_cmd awk cmp install ip sed
 
 if [[ "${RUN_UPDATES}" == "true" ]]; then
   log_info "Running apt update/dist-upgrade..."
