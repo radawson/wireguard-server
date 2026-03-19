@@ -151,13 +151,25 @@ copy_if_changed_sudo() {
 
 resolve_repo_source() {
   local rel_path="$1"
+  shift || true
   local local_path="${SCRIPT_DIR}/${rel_path}"
   local out_path="${DOWNLOAD_TMP_DIR}/${rel_path##*/}"
+  local candidate
+
   if [[ -f "${local_path}" ]]; then
     printf "%s\n" "${local_path}"
     return 0
   fi
-  log_warn "Missing local file '${local_path}', downloading from ${RAW_REPO_BASE}/${RAW_BRANCH}/${rel_path}"
+
+  for candidate in "$@"; do
+    [[ -z "${candidate}" ]] && continue
+    if [[ -f "${candidate}" ]]; then
+      printf "%s\n" "${candidate}"
+      return 0
+    fi
+  done
+
+  log_info "Downloading '${rel_path}' from ${RAW_REPO_BASE}/${RAW_BRANCH}/${rel_path}"
   download_raw_file "${rel_path}" "${out_path}" || die "Failed downloading '${rel_path}' from GitHub raw."
   printf "%s\n" "${out_path}"
 }
@@ -251,10 +263,10 @@ CONFIG_DIR="${CONFIG_DIR}"
 EOF
 
 log_info "Installing config templates..."
-SERVER_TEMPLATE_SOURCE="$(resolve_repo_source "config/wg0-server.example.conf")"
-CLIENT_TEMPLATE_SOURCE="$(resolve_repo_source "config/wg0-client.example.conf")"
-INSTALL_CLIENT_SOURCE="$(resolve_repo_source "tools/install-client.sh")"
-WG_CLIENT_SOURCE="$(resolve_repo_source "tools/wg-client.sh")"
+CLIENT_TEMPLATE_SOURCE="$(resolve_repo_source "config/wg0-client.example.conf" "${CONFIG_DIR}/wg0-client.example.conf")"
+SERVER_TEMPLATE_SOURCE="$(resolve_repo_source "config/wg0-server.example.conf" "${CONFIG_DIR}/wg0-server.example.conf")"
+INSTALL_CLIENT_SOURCE="$(resolve_repo_source "tools/install-client.sh" "${WG_SHARE_INSTALL_CLIENT}")"
+WG_CLIENT_SOURCE="$(resolve_repo_source "tools/wg-client.sh" "${WG_CLIENT_BIN}")"
 copy_if_changed_sudo "${SERVER_TEMPLATE_SOURCE}" "${CONFIG_DIR}/wg0-server.example.conf" 0644
 copy_if_changed_sudo "${CLIENT_TEMPLATE_SOURCE}" "${CONFIG_DIR}/wg0-client.example.conf" 0644
 copy_if_changed_sudo "${COMMON_SOURCE_FILE}" "${WG_SHARE_LIB}" 0644
